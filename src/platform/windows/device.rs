@@ -277,27 +277,6 @@ fn reject_existing_wintun(reuse: Option<bool>, visible: bool, orphan: bool) -> b
     !reuse_existing_adapter(reuse) && (visible || orphan)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{adapter_name_visible, reject_existing_wintun, reuse_existing_adapter};
-    use std::collections::HashSet;
-
-    #[test]
-    fn explicit_no_reuse_rejects_existing_wintun() {
-        assert!(reuse_existing_adapter(None));
-        assert!(reuse_existing_adapter(Some(true)));
-        assert!(!reuse_existing_adapter(Some(false)));
-        assert!(reject_existing_wintun(Some(false), true, false));
-        assert!(reject_existing_wintun(Some(false), false, true));
-        assert!(!reject_existing_wintun(Some(false), false, false));
-        assert!(!reject_existing_wintun(Some(true), true, true));
-        assert!(adapter_name_visible(
-            &HashSet::from(["Linq0".to_owned()]),
-            "linq0"
-        ));
-    }
-}
-
 // Public User interface
 impl DeviceImpl {
     /// Retrieves the name of the device.
@@ -580,5 +559,26 @@ impl DeviceImpl {
     pub fn clear_dns_servers(&self, is_ipv4: bool) -> io::Result<()> {
         let _guard = self.lock.write().unwrap();
         dns::clear_dns_servers(self.if_index_impl()?, &self.luid_impl(), is_ipv4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adapter_name_visible, reject_existing_wintun, reuse_existing_adapter};
+    use std::collections::HashSet;
+
+    #[test]
+    fn explicit_no_reuse_rejects_existing_wintun() {
+        assert!(reuse_existing_adapter(None));
+        assert!(reuse_existing_adapter(Some(true)));
+        assert!(!reuse_existing_adapter(Some(false)));
+        assert!(reject_existing_wintun(Some(false), true, false));
+        assert!(reject_existing_wintun(Some(false), false, true));
+        assert!(!reject_existing_wintun(Some(false), false, false));
+        assert!(!reject_existing_wintun(Some(true), true, true));
+        assert!(adapter_name_visible(
+            &HashSet::from(["Linq0".to_owned()]),
+            "linq0"
+        ));
     }
 }

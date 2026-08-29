@@ -423,6 +423,26 @@ fn is_windows_seven() -> io::Result<bool> {
     Ok(info.dwMajorVersion == 6 && info.dwMinorVersion == 1)
 }
 
+fn dev_node_status(devinfo_data: &SP_DEVINFO_DATA) -> io::Result<CM_DEVNODE_STATUS_FLAGS> {
+    let mut pulstatus = 0;
+    let mut pulproblemnumber = 0;
+
+    let cr = unsafe {
+        CM_Get_DevNode_Status(
+            &mut pulstatus,
+            &mut pulproblemnumber,
+            devinfo_data.DevInst,
+            0,
+        )
+    };
+
+    if cr != CR_SUCCESS {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(pulstatus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{adapter_name_matches, classify_exact_matches, parse_device_guid};
@@ -459,24 +479,4 @@ mod tests {
         assert!(parse_device_guid("{01234567-89ab-cdef-8123-456789abcdef").is_err());
         assert!(parse_device_guid("not-a-guid").is_err());
     }
-}
-
-fn dev_node_status(devinfo_data: &SP_DEVINFO_DATA) -> io::Result<CM_DEVNODE_STATUS_FLAGS> {
-    let mut pulstatus = 0;
-    let mut pulproblemnumber = 0;
-
-    let cr = unsafe {
-        CM_Get_DevNode_Status(
-            &mut pulstatus,
-            &mut pulproblemnumber,
-            devinfo_data.DevInst,
-            0,
-        )
-    };
-
-    if cr != CR_SUCCESS {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(pulstatus)
 }
