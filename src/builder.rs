@@ -756,7 +756,7 @@ impl DeviceBuilderGuard<'_> {
     }
     /// Controls whether to reuse an existing device with the same name.
     ///
-    /// In TAP mode, if a device with the specified name already exists:
+    /// In TAP mode, and for named Windows Wintun adapters, if a device with the specified name already exists:
     /// - When `true` (default): The existing device will be reused
     /// - When `false`: An error will be returned
     ///
@@ -785,7 +785,7 @@ impl DeviceBuilderGuard<'_> {
     ///
     /// # Platform
     ///
-    /// macOS, Windows, NetBSD only. TAP mode (Layer 2) only.
+    /// macOS and NetBSD TAP mode; Windows TAP and Wintun modes.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "netbsd"))]
     pub fn reuse_dev(&mut self, reuse: bool) -> &mut Self {
         self.0.reuse_dev = Some(reuse);
@@ -1156,7 +1156,8 @@ impl DeviceBuilder {
         self.associate_route = Some(associate_route);
         self
     }
-    /// Only works in TAP mode.
+    /// Controls reuse of an existing device with the same name.
+    /// On Windows this also applies to named Wintun adapters (L3).
     /// If true (default), the existing device with the given name will be used if possible.
     /// If false, an error will be returned if a device with the specified name already exists.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "netbsd"))]

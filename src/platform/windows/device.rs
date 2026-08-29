@@ -52,15 +52,32 @@ impl DeviceImpl {
                 let default_name = format!("tun{count}");
                 count += 1;
                 let name = config.dev_name.as_deref().unwrap_or(&default_name);
+                let visible = adapter_name_visible(&interfaces, name);
+                let orphan = if config.dev_name.is_some() {
+                    check_adapter_if_orphaned_devices(
+                        name,
+                        !reuse_existing_adapter(config.reuse_dev),
+                    )?
+                } else {
+                    false
+                };
 
-                if interfaces.contains(name) {
+                if config.dev_name.is_some()
+                    && reject_existing_wintun(config.reuse_dev, visible, orphan)
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("The network adapter [{name}] already exists."),
+                    ))?
+                }
+
+                if visible {
                     if config.dev_name.is_none() {
                         continue;
                     }
 
                     // Resolves an issue where there are orphaned adapters. fixes #33
-                    let is_orphaned_adapter = check_adapter_if_orphaned_devices(name);
-                    if !is_orphaned_adapter {
+                    if !orphan {
                         // Try to open an existing Wintun adapter.
                         break TunDevice::open(
                             wintun_file,
@@ -106,7 +123,7 @@ impl DeviceImpl {
                     if config.dev_name.is_none() {
                         count += 1;
                         continue;
-                    } else if !config.reuse_dev.unwrap_or(true) {
+                    } else if !reuse_existing_adapter(config.reuse_dev) {
                         Err(io::Error::other(format!(
                             "The network adapter [{name}] already exists."
                         )))?
@@ -243,6 +260,41 @@ impl DeviceImpl {
             Driver::Tun(tun) => tun.get_name(),
             Driver::Tap(tap) => tap.get_name(),
         }
+    }
+}
+
+fn reuse_existing_adapter(reuse: Option<bool>) -> bool {
+    reuse.unwrap_or(true)
+}
+
+fn adapter_name_visible(interfaces: &HashSet<String>, name: &str) -> bool {
+    interfaces
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+}
+
+fn reject_existing_wintun(reuse: Option<bool>, visible: bool, orphan: bool) -> bool {
+    !reuse_existing_adapter(reuse) && (visible || orphan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adapter_name_visible, reject_existing_wintun, reuse_existing_adapter};
+    use std::collections::HashSet;
+
+    #[test]
+    fn explicit_no_reuse_rejects_existing_wintun() {
+        assert!(reuse_existing_adapter(None));
+        assert!(reuse_existing_adapter(Some(true)));
+        assert!(!reuse_existing_adapter(Some(false)));
+        assert!(reject_existing_wintun(Some(false), true, false));
+        assert!(reject_existing_wintun(Some(false), false, true));
+        assert!(!reject_existing_wintun(Some(false), false, false));
+        assert!(!reject_existing_wintun(Some(true), true, true));
+        assert!(adapter_name_visible(
+            &HashSet::from(["Linq0".to_owned()]),
+            "linq0"
+        ));
     }
 }
 

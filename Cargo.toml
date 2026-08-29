@@ -64,6 +64,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_Devices_Properties",
     "Win32_System_SystemInformation",
+    "Wdk_System_SystemServices",
 ] }
 libloading = "0.9"
 

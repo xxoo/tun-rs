@@ -1,4 +1,4 @@
-use std::{mem, ptr};
+use std::{io, mem, ptr};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetClassDevsExW, SetupDiGetDevicePropertyW,
 };
@@ -16,14 +16,19 @@ use crate::windows::{
     tun::adapter::{get_device_name, DEVPKEY_Wintun_OwningProcess},
 };
 
+pub(super) const WINTUN_ENUMERATOR: &str = "ROOT\\Wintun";
+
 #[repr(C)]
 pub struct OwningProcess {
     process_id: u32,
     creation_time: FILETIME,
 }
 
-pub fn check_adapter_if_orphaned_devices_win7(adapter_name: &str) -> bool {
-    let device_name = encode_utf16("ROOT\\Wintun");
+pub fn check_adapter_if_orphaned_devices_win7(
+    adapter_name: &str,
+    include_live: bool,
+) -> io::Result<bool> {
+    let device_name = encode_utf16(WINTUN_ENUMERATOR);
     let dev_info = unsafe {
         SetupDiGetClassDevsExW(
             &GUID_NETWORK_ADAPTER,
@@ -37,19 +42,15 @@ pub fn check_adapter_if_orphaned_devices_win7(adapter_name: &str) -> bool {
     };
     if dev_info == INVALID_HANDLE_VALUE as isize {
         if unsafe { GetLastError() } != ERROR_INVALID_DATA {
-            log::error!("Failed to get adapters");
+            return Err(io::Error::last_os_error());
         }
-        return false;
+        return Ok(false);
     }
 
     let mut index = 0;
-    let is_orphaned_adapter = loop {
+    let result = loop {
         match enum_device_info(dev_info, index) {
-            Some(ret) => {
-                let Ok(devinfo_data) = ret else {
-                    continue;
-                };
-
+            Some(Ok(devinfo_data)) => {
                 unsafe {
                     let mut ptype = mem::zeroed();
                     let mut buf: [u8; mem::size_of::<OwningProcess>()] = mem::zeroed();
@@ -65,32 +66,36 @@ pub fn check_adapter_if_orphaned_devices_win7(adapter_name: &str) -> bool {
                         0,
                     );
 
-                    if ok != 0 && ptype == DEVPROP_TYPE_BINARY && {
+                    if !include_live && ok != 0 && ptype == DEVPROP_TYPE_BINARY && {
                         // SAFETY: buf is [u8] (alignment 1) but OwningProcess requires alignment 4.
                         // Use read_unaligned to avoid UB from misaligned access.
                         let owning_process =
                             std::ptr::read_unaligned(buf.as_ptr() as *const OwningProcess);
                         !process_is_stale(&owning_process)
                     } {
+                        index += 1;
                         continue;
                     }
                 }
 
-                let Ok(name) = get_device_name(dev_info, &devinfo_data) else {
-                    index += 1;
-                    continue;
+                let name = match get_device_name(dev_info, &devinfo_data) {
+                    Ok(name) => name,
+                    Err(error) => break Err(error),
                 };
-                if adapter_name == name {
-                    break true;
+                if super::adapter::adapter_name_matches(adapter_name, &name) {
+                    break Ok(true);
                 }
             }
-            None => break false,
+            Some(Err(error)) => break Err(error),
+            None => break Ok(false),
         }
 
         index += 1;
     };
-    _ = destroy_device_info_list(dev_info);
-    is_orphaned_adapter
+    match (result, destroy_device_info_list(dev_info)) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 fn process_is_stale(owning_process: &OwningProcess) -> bool {
@@ -119,6 +124,6 @@ fn process_is_stale(owning_process: &OwningProcess) -> bool {
     if ret == 0 {
         return false;
     }
-    creation_time.dwHighDateTime == owning_process.creation_time.dwHighDateTime
-        && creation_time.dwLowDateTime == owning_process.creation_time.dwLowDateTime
+    creation_time.dwHighDateTime != owning_process.creation_time.dwHighDateTime
+        || creation_time.dwLowDateTime != owning_process.creation_time.dwLowDateTime
 }

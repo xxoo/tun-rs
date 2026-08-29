@@ -18,3 +18,4 @@ mod tun;
 pub use interrupt::InterruptEvent;
 
 pub use device::DeviceImpl;
+pub use tun::{remove_wintun_adapter_exact, wintun_adapter_exists_exact};

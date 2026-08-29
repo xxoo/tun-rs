@@ -46,7 +46,7 @@ pub use self::netbsd::DeviceImpl;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
 #[cfg(target_os = "windows")]
-pub use self::windows::DeviceImpl;
+pub use self::windows::{remove_wintun_adapter_exact, wintun_adapter_exists_exact, DeviceImpl};
 
 #[cfg(target_vendor = "apple")]
 pub mod apple;
