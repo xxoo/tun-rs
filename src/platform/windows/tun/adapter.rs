@@ -168,10 +168,7 @@ fn scan_exact_adapter(
     let mut devices = Vec::new();
     let mut matches = Vec::new();
     let mut index = 0;
-    loop {
-        let Some(devinfo_data) = enum_device_info(dev_info, index) else {
-            break;
-        };
+    while let Some(devinfo_data) = enum_device_info(dev_info, index) {
         let devinfo_data = devinfo_data?;
         let name = get_device_name(dev_info, &devinfo_data)?;
         let guid = get_device_guid(dev_info, &devinfo_data)?;
@@ -354,7 +351,7 @@ pub fn get_device_name(devinfo: HDEVINFO, devinfo_data: &SP_DEVINFO_DATA) -> io:
             return Err(err);
         }
     }
-    if required_size < 2 || required_size > 512 || !required_size.is_multiple_of(2) {
+    if !(2..=512).contains(&required_size) || !required_size.is_multiple_of(2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid Wintun adapter name property",
