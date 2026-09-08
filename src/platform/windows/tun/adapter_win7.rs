@@ -13,7 +13,9 @@ use windows_sys::Win32::System::Threading::{
 use crate::windows::{
     device::GUID_NETWORK_ADAPTER,
     ffi::{destroy_device_info_list, encode_utf16, enum_device_info},
-    tun::adapter::{get_device_name, DEVPKEY_Wintun_OwningProcess},
+    tun::adapter::{
+        adapter_matches_scan, adapter_scan_flags, get_device_name, DEVPKEY_Wintun_OwningProcess,
+    },
 };
 
 pub(super) const WINTUN_ENUMERATOR: &str = "ROOT\\Wintun";
@@ -34,7 +36,7 @@ pub fn check_adapter_if_orphaned_devices_win7(
             &GUID_NETWORK_ADAPTER,
             device_name.as_ptr(),
             ptr::null_mut(),
-            0,
+            adapter_scan_flags(include_live),
             0,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -51,39 +53,38 @@ pub fn check_adapter_if_orphaned_devices_win7(
     let result = loop {
         match enum_device_info(dev_info, index) {
             Some(Ok(devinfo_data)) => {
-                unsafe {
-                    let mut ptype = mem::zeroed();
-                    let mut buf: [u8; mem::size_of::<OwningProcess>()] = mem::zeroed();
+                match adapter_matches_scan(
+                    adapter_name,
+                    include_live,
+                    || unsafe {
+                        let mut ptype = mem::zeroed();
+                        let mut buf: [u8; mem::size_of::<OwningProcess>()] = mem::zeroed();
 
-                    let ok = SetupDiGetDevicePropertyW(
-                        dev_info,
-                        &devinfo_data,
-                        &DEVPKEY_Wintun_OwningProcess,
-                        &mut ptype,
-                        &mut buf as _,
-                        buf.len() as _,
-                        ptr::null_mut(),
-                        0,
-                    );
+                        let ok = SetupDiGetDevicePropertyW(
+                            dev_info,
+                            &devinfo_data,
+                            &DEVPKEY_Wintun_OwningProcess,
+                            &mut ptype,
+                            &mut buf as _,
+                            buf.len() as _,
+                            ptr::null_mut(),
+                            0,
+                        );
 
-                    if !include_live && ok != 0 && ptype == DEVPROP_TYPE_BINARY && {
-                        // SAFETY: buf is [u8] (alignment 1) but OwningProcess requires alignment 4.
-                        // Use read_unaligned to avoid UB from misaligned access.
-                        let owning_process =
-                            std::ptr::read_unaligned(buf.as_ptr() as *const OwningProcess);
-                        !process_is_stale(&owning_process)
-                    } {
-                        index += 1;
-                        continue;
-                    }
-                }
-
-                let name = match get_device_name(dev_info, &devinfo_data) {
-                    Ok(name) => name,
+                        if ok != 0 && ptype == DEVPROP_TYPE_BINARY {
+                            // SAFETY: buf has byte alignment; OwningProcess requires alignment 4.
+                            let owning_process =
+                                std::ptr::read_unaligned(buf.as_ptr() as *const OwningProcess);
+                            Ok(process_is_stale(&owning_process))
+                        } else {
+                            Ok(true)
+                        }
+                    },
+                    || get_device_name(dev_info, &devinfo_data),
+                ) {
+                    Ok(true) => break Ok(true),
+                    Ok(false) => {}
                     Err(error) => break Err(error),
-                };
-                if super::adapter::adapter_name_matches(adapter_name, &name) {
-                    break Ok(true);
                 }
             }
             Some(Err(error)) => break Err(error),

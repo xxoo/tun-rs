@@ -8,7 +8,8 @@ use crate::windows::{
     },
 };
 use windows_sys::Win32::Foundation::{
-    DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA, INVALID_HANDLE_VALUE,
+    DEVPROPKEY, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::{
     core::GUID,
@@ -16,10 +17,11 @@ use windows_sys::{
     Win32::{
         Devices::{
             DeviceAndDriverInstallation::{
-                CM_Get_DevNode_Status, SetupDiGetClassDevsExW, SetupDiGetDevicePropertyW,
-                SetupDiSetClassInstallParamsW, CM_DEVNODE_STATUS_FLAGS, CR_SUCCESS,
-                DICS_FLAG_GLOBAL, DIF_REMOVE, DIREG_DRV, DI_REMOVEDEVICE_GLOBAL, DN_HAS_PROBLEM,
-                HDEVINFO, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_REMOVEDEVICE_PARAMS,
+                CM_Get_DevNode_Status, CM_MapCrToWin32Err, SetupDiGetClassDevsExW,
+                SetupDiGetDevicePropertyW, SetupDiSetClassInstallParamsW, CM_DEVNODE_STATUS_FLAGS,
+                CONFIGRET, CR_SUCCESS, DICS_FLAG_GLOBAL, DIF_REMOVE, DIGCF_PRESENT, DIREG_DRV,
+                DI_REMOVEDEVICE_GLOBAL, DN_HAS_PROBLEM, HDEVINFO, SP_CLASSINSTALL_HEADER,
+                SP_DEVINFO_DATA, SP_REMOVEDEVICE_PARAMS,
             },
             Properties::{DEVPROPID_FIRST_USABLE, DEVPROP_TYPE_STRING},
         },
@@ -53,6 +55,28 @@ pub const DEVPKEY_Wintun_OwningProcess: DEVPROPKEY = DEVPROPKEY {
 
 pub(super) fn adapter_name_matches(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
+}
+
+pub(super) fn adapter_scan_flags(include_live: bool) -> u32 {
+    if include_live {
+        DIGCF_PRESENT
+    } else {
+        0
+    }
+}
+
+pub(super) fn adapter_matches_scan(
+    adapter_name: &str,
+    include_live: bool,
+    is_orphaned: impl FnOnce() -> io::Result<bool>,
+    read_name: impl FnOnce() -> io::Result<String>,
+) -> io::Result<bool> {
+    // Present adapters remain occupied even when disabled or without IP addresses.
+    // Only the legacy reuse path needs an orphan-status or owning-process query.
+    if !include_live && !is_orphaned()? {
+        return Ok(false);
+    }
+    Ok(adapter_name_matches(adapter_name, &read_name()?))
 }
 
 fn classify_exact_matches(matches: &[(bool, bool)]) -> io::Result<Option<usize>> {
@@ -285,7 +309,7 @@ pub fn check_adapter_if_orphaned_devices(
             &GUID_NETWORK_ADAPTER,
             device_name.as_ptr(),
             ptr::null_mut(),
-            0,
+            adapter_scan_flags(include_live),
             0,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -299,22 +323,15 @@ pub fn check_adapter_if_orphaned_devices(
     let result = loop {
         match enum_device_info(dev_info, index) {
             Some(Ok(devinfo_data)) => {
-                let status = match dev_node_status(&devinfo_data) {
-                    Ok(status) => status,
+                match adapter_matches_scan(
+                    adapter_name,
+                    include_live,
+                    || dev_node_status(&devinfo_data).map(|status| status & DN_HAS_PROBLEM != 0),
+                    || get_device_name(dev_info, &devinfo_data),
+                ) {
+                    Ok(true) => break Ok(true),
+                    Ok(false) => {}
                     Err(error) => break Err(error),
-                };
-                if !include_live && status & DN_HAS_PROBLEM == 0 {
-                    index += 1;
-                    continue;
-                }
-
-                let name = match get_device_name(dev_info, &devinfo_data) {
-                    Ok(name) => name,
-                    Err(error) => break Err(error),
-                };
-
-                if adapter_name_matches(adapter_name, &name) {
-                    break Ok(true);
                 }
             }
             Some(Err(error)) => break Err(error),
@@ -437,15 +454,114 @@ fn dev_node_status(devinfo_data: &SP_DEVINFO_DATA) -> io::Result<CM_DEVNODE_STAT
     };
 
     if cr != CR_SUCCESS {
-        return Err(io::Error::last_os_error());
+        return Err(config_ret_error(cr));
     }
 
     Ok(pulstatus)
 }
 
+fn config_ret_error(cr: CONFIGRET) -> io::Error {
+    // Configuration Manager returns CONFIGRET directly; GetLastError is unrelated.
+    let error = unsafe { CM_MapCrToWin32Err(cr, ERROR_GEN_FAILURE) };
+    io::Error::from_raw_os_error(error as i32)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{adapter_name_matches, classify_exact_matches, parse_device_guid};
+    use super::{
+        adapter_matches_scan, adapter_name_matches, adapter_scan_flags, classify_exact_matches,
+        config_ret_error, parse_device_guid,
+    };
+    use std::{cell::Cell, io};
+    use windows_sys::Win32::{
+        Devices::DeviceAndDriverInstallation::{
+            CM_MapCrToWin32Err, CR_NO_SUCH_DEVNODE, DIGCF_PRESENT,
+        },
+        Foundation::{SetLastError, ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE},
+    };
+
+    #[test]
+    fn present_scan_ignores_legacy_status_for_all_present_adapters() {
+        assert_eq!(adapter_scan_flags(true), DIGCF_PRESENT);
+        // A present disabled/no-IP adapter must match even if the legacy probe would
+        // report healthy, orphaned, or fail on an obsolete devnode/process handle.
+        for status in [
+            Ok(false),
+            Ok(true),
+            Err(io::Error::other("obsolete status")),
+        ] {
+            let queried = Cell::new(false);
+            assert!(adapter_matches_scan(
+                "linq0",
+                true,
+                || {
+                    queried.set(true);
+                    status
+                },
+                || Ok("Linq0".to_owned()),
+            )
+            .unwrap());
+            assert!(!queried.get());
+        }
+        assert!(!adapter_matches_scan(
+            "linq0",
+            true,
+            || panic!("present scan queried legacy status"),
+            || Ok("other".to_owned()),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn legacy_reuse_scan_preserves_orphan_filter_and_errors() {
+        assert_eq!(adapter_scan_flags(false), 0);
+        assert!(!adapter_matches_scan(
+            "linq0",
+            false,
+            || Ok(false),
+            || panic!("legacy live adapter name must not be queried"),
+        )
+        .unwrap());
+        assert!(
+            adapter_matches_scan("linq0", false, || Ok(true), || Ok("Linq0".to_owned()),).unwrap()
+        );
+        assert!(
+            !adapter_matches_scan("linq0", false, || Ok(true), || Ok("other".to_owned()),).unwrap()
+        );
+        let error = adapter_matches_scan(
+            "linq0",
+            false,
+            || Err(io::Error::from_raw_os_error(123)),
+            || panic!("failed legacy probe must stop the scan"),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(123));
+        let error = adapter_matches_scan(
+            "linq0",
+            true,
+            || panic!("present scan queried legacy status"),
+            || Err(io::Error::from_raw_os_error(456)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(456));
+    }
+
+    #[test]
+    fn config_ret_errors_do_not_use_the_thread_last_error() {
+        let expected = unsafe { CM_MapCrToWin32Err(CR_NO_SUCH_DEVNODE, ERROR_GEN_FAILURE) };
+        assert_ne!(expected, 0);
+        for last_error in [0, ERROR_ACCESS_DENIED] {
+            unsafe { SetLastError(last_error) };
+            assert_eq!(
+                config_ret_error(CR_NO_SUCH_DEVNODE).raw_os_error(),
+                Some(expected as i32),
+            );
+        }
+        assert_eq!(
+            config_ret_error(u32::MAX).raw_os_error(),
+            Some(ERROR_GEN_FAILURE as i32),
+        );
+    }
 
     #[test]
     fn wintun_names_are_case_insensitive() {
