@@ -530,14 +530,27 @@ where
     }
 }
 fn compute_buffer_size<T: Borrow<AsyncDevice>>(_dev: &T) -> usize {
+    // The interface MTU covers only the L3 payload. In TAP (Layer::L2) mode the
+    // device delivers complete Ethernet frames, which exceed the MTU by the
+    // Ethernet header (14 bytes) — plus 4 bytes when the frame carries an
+    // IEEE 802.1Q VLAN tag (double-tagged QinQ frames would need 8). Sizing the
+    // buffer to the raw MTU would reject almost every TAP packet ("receive
+    // buffer too small"); always add the header + VLAN overhead so the same
+    // default works for both TUN and TAP (for TUN this only costs a few extra
+    // bytes).
+    const ETHERNET_HEADER_LEN: usize = 14;
+    const VLAN_TAG_LEN: usize = 4;
+    const FRAME_OVERHEAD: usize = ETHERNET_HEADER_LEN + VLAN_TAG_LEN;
+
     #[cfg(any(
         target_os = "windows",
         all(target_os = "linux", not(target_env = "ohos")),
         target_os = "macos",
         target_os = "freebsd",
         target_os = "openbsd",
+        target_os = "netbsd",
     ))]
-    let mtu = _dev.borrow().mtu().map(|m| m as usize).unwrap_or(4096);
+    let mtu = _dev.borrow().mtu().map(|m| m as usize).unwrap_or(4096) + FRAME_OVERHEAD;
 
     #[cfg(not(any(
         target_os = "windows",
@@ -545,16 +558,16 @@ fn compute_buffer_size<T: Borrow<AsyncDevice>>(_dev: &T) -> usize {
         target_os = "macos",
         target_os = "freebsd",
         target_os = "openbsd",
+        target_os = "netbsd",
     )))]
-    let mtu = 4096usize;
+    let mtu = 4096usize + FRAME_OVERHEAD;
 
     #[cfg(windows)]
-    {
-        let mtu_v6 = _dev.borrow().mtu_v6().map(|m| m as usize).unwrap_or(4096);
-        mtu.max(mtu_v6)
-    }
+    let mtu_v6 = _dev.borrow().mtu_v6().map(|m| m as usize).unwrap_or(4096) + FRAME_OVERHEAD;
     #[cfg(not(windows))]
-    mtu
+    let mtu_v6 = 0usize;
+
+    mtu.max(mtu_v6)
 }
 struct ReadState {
     recv_buffer_size: usize,
