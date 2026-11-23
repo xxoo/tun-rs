@@ -210,11 +210,7 @@ pub fn pseudo_header_checksum_no_fold(
 
 #[cfg(test)]
 mod tests {
-    use rand::RngExt;
-    // Assuming these paths are correct for your project structure
-    use crate::platform::linux::checksum::{
-        checksum_no_fold_avx2, checksum_no_fold_scalar, checksum_no_fold_sse41,
-    };
+    use super::checksum_no_fold_scalar;
 
     #[test]
     fn checksum_no_fold_wraps_accumulator_consistently() {
@@ -250,14 +246,11 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_checksum_avx2_vs_scalar_output() {
-        // Only run this test on x86/x64 architectures if AVX2 feature is detected
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if !is_x86_feature_detected!("avx2") {
-            println!("AVX2 feature not detected. Skipping AVX2 checksum output comparison tests.");
-            return;
-        }
+        use super::{checksum_no_fold_avx2, checksum_no_fold_sse41};
+        use rand::RngExt;
 
         // Initialize random number generator
         let mut rng = rand::rng(); // Changed from rand::rng() to rand::thread_rng() for correctness
