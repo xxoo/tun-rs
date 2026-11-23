@@ -21,8 +21,7 @@ use std::task::{Context, Poll};
 /// ```no_run
 /// use tun_rs::{AsyncDevice, DeviceBuilder};
 ///
-/// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
+/// # async fn example() -> std::io::Result<()> {
 ///     // Create a TUN device with basic configuration
 ///     let dev = DeviceBuilder::new()
 ///         .name("tun0")
@@ -40,7 +39,7 @@ use std::task::{Context, Poll};
 ///     println!("Received {} bytes: {:?}", n, &buf[..n]);
 ///
 ///     Ok(())
-/// }
+/// # }
 /// ```
 pub struct AsyncDevice(pub(crate) Async<DeviceImpl>);
 impl AsyncDevice {
@@ -182,6 +181,12 @@ impl AsyncDevice {
     }
     pub(crate) fn into_device(self) -> io::Result<DeviceImpl> {
         self.0.into_inner()
+    }
+
+    /// Waits until the device is readable; `async-io` also reports an error
+    /// condition as readable.
+    pub(crate) async fn wait_readable(&self) -> io::Result<()> {
+        self.0.readable().await
     }
 
     pub(crate) async fn read_with<R>(

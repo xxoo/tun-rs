@@ -11,12 +11,12 @@ use crate::{
 use crate::platform::unix::device::{copy_device_name, ctl, ctl_v6};
 use libc::{
     self, c_char, c_short, fcntl, ifreq, kinfo_file, AF_LINK, F_KINFO, IFF_RUNNING, IFF_UP,
-    IFNAMSIZ, KINFO_FILE_SIZE, O_RDWR,
+    IFNAMSIZ, O_RDWR,
 };
 use std::io::ErrorKind;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{ffi::CStr, io, mem, net::IpAddr, os::unix::io::AsRawFd, ptr, sync::RwLock};
+use std::{ffi::CStr, io, mem, net::IpAddr, os::unix::io::AsRawFd, sync::RwLock};
 
 /// A TUN device using the TUN/TAP Linux driver.
 pub struct DeviceImpl {
@@ -38,7 +38,7 @@ impl Drop for DeviceImpl {
             return;
         }
         // Construct the request before we do anything
-        let request = unsafe { self.request() };
+        let request = self.request();
         let fd = self.tun.fd.inner;
         self.tun.fd.inner = -1;
         unsafe {
@@ -170,7 +170,7 @@ impl DeviceImpl {
         unsafe {
             let tun_name = self.name_impl()?;
             let mut req: in6_ndireq = mem::zeroed();
-            copy_device_name(&tun_name, req.ifra_name.as_mut_ptr(), IFNAMSIZ);
+            copy_device_name(&tun_name, &mut req.ifra_name)?;
             req.ndi.flags &= !(ND6_IFF_AUTO_LINKLOCAL as u32);
             if let Err(err) = siocsifinfoin6(ctl_v6()?.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err));
@@ -218,11 +218,7 @@ impl DeviceImpl {
                     let ctl = ctl()?;
                     let mut req: ifaliasreq = mem::zeroed();
                     let tun_name = self.name_impl()?;
-                    ptr::copy_nonoverlapping(
-                        tun_name.as_ptr() as *const c_char,
-                        req.ifran.as_mut_ptr(),
-                        tun_name.len(),
-                    );
+                    copy_device_name(&tun_name, &mut req.ifran)?;
 
                     req.addr = crate::platform::unix::sockaddr_union::from((addr, 0)).addr;
                     if let Some(dest) = dest {
@@ -243,11 +239,7 @@ impl DeviceImpl {
                     };
                     let tun_name = self.name_impl()?;
                     let mut req: in6_ifaliasreq = mem::zeroed();
-                    ptr::copy_nonoverlapping(
-                        tun_name.as_ptr() as *const c_char,
-                        req.ifra_name.as_mut_ptr(),
-                        tun_name.len(),
-                    );
+                    copy_device_name(&tun_name, &mut req.ifra_name)?;
                     req.ifra_addr = sockaddr_union::from((addr, 0)).addr6;
                     req.ifra_prefixmask = sockaddr_union::from((mask, 0)).addr6;
                     req.in6_addrlifetime.ia6t_vltime = 0xffffffff_u32;
@@ -264,18 +256,22 @@ impl DeviceImpl {
     }
 
     /// Prepare a new request.
-    unsafe fn request(&self) -> std::io::Result<ifreq> {
-        let mut req: ifreq = mem::zeroed();
+    fn request(&self) -> std::io::Result<ifreq> {
+        // SAFETY: ifreq is a C request POD; zero initializes the union and scalar fields
+        // to the kernel ABI's empty-request state before the interface name is populated.
+        let mut req: ifreq = unsafe { mem::zeroed() };
         let tun_name = self.name_impl()?;
-        copy_device_name(&tun_name, req.ifr_name.as_mut_ptr(), IFNAMSIZ);
+        copy_device_name(&tun_name, &mut req.ifr_name)?;
         Ok(req)
     }
 
-    /// # Safety
-    unsafe fn request_v6(&self) -> std::io::Result<in6_ifreq> {
+    /// Prepare a new IPv6 request.
+    fn request_v6(&self) -> std::io::Result<in6_ifreq> {
         let tun_name = self.name_impl()?;
-        let mut req: in6_ifreq = mem::zeroed();
-        copy_device_name(&tun_name, req.ifra_name.as_mut_ptr(), IFNAMSIZ);
+        // SAFETY: in6_ifreq is a C request POD; zero is the kernel ABI's empty request
+        // state before the interface name and flags are populated.
+        let mut req: in6_ifreq = unsafe { mem::zeroed() };
+        copy_device_name(&tun_name, &mut req.ifra_name)?;
         req.ifr_ifru.ifru_flags = IN6_IFF_NODAD as _;
         Ok(req)
     }
@@ -316,7 +312,7 @@ impl DeviceImpl {
         use std::path::PathBuf;
         unsafe {
             let mut path_info: kinfo_file = std::mem::zeroed();
-            path_info.kf_structsize = KINFO_FILE_SIZE;
+            path_info.kf_structsize = std::mem::size_of::<kinfo_file>() as libc::c_int;
             if fcntl(tun.as_raw_fd(), F_KINFO, &mut path_info as *mut _) < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -388,13 +384,13 @@ impl DeviceImpl {
 impl DeviceImpl {
     /// Retrieves the name of the network interface.
     pub fn name(&self) -> std::io::Result<String> {
-        let _guard = self.op_lock.read().unwrap();
+        let _guard = crate::platform::unix::read_operation_lock(&self.op_lock);
         self.name_impl()
     }
     /// Sets a new name for the network interface.
     pub fn set_name(&self, value: &str) -> std::io::Result<()> {
         use std::ffi::CString;
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         unsafe {
             if value.len() > IFNAMSIZ {
                 return Err(std::io::Error::new(
@@ -422,13 +418,13 @@ impl DeviceImpl {
     /// If true (default), the program will automatically add or remove routes to provide consistent routing behavior across all platforms.
     /// Set this to be false to obtain the platform's default routing behavior.
     pub fn set_associate_route(&self, associate_route: bool) {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         self.associate_route
             .store(associate_route, Ordering::Relaxed);
     }
     /// Retrieve whether route is associated with the IP setting interface, see [`DeviceImpl::set_associate_route`]
     pub fn associate_route(&self) -> bool {
-        let _guard = self.op_lock.read().unwrap();
+        let _guard = crate::platform::unix::read_operation_lock(&self.op_lock);
         self.associate_route.load(Ordering::Relaxed)
     }
 
@@ -443,7 +439,7 @@ impl DeviceImpl {
     /// # Note
     /// Retrieve whether the packet is ignored for the TUN Device; The TAP device always returns `false`.
     pub fn ignore_packet_info(&self) -> bool {
-        let _guard = self.op_lock.read().unwrap();
+        let _guard = crate::platform::unix::read_operation_lock(&self.op_lock);
         self.tun.ignore_packet_info()
     }
     /// Sets whether the TUN device should ignore packet information (PI).
@@ -459,7 +455,7 @@ impl DeviceImpl {
     /// # Note
     /// This only works for a TUN device; The invocation will be ignored if the device is a TAP.
     pub fn set_ignore_packet_info(&self, ign: bool) {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         if let Ok(name) = self.name_impl() {
             if name.starts_with("tun") {
                 self.tun.set_ignore_packet_info(ign)
@@ -468,7 +464,7 @@ impl DeviceImpl {
     }
     /// Enables or disables the network interface.
     pub fn enabled(&self, value: bool) -> std::io::Result<()> {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         unsafe {
             let mut req = self.request()?;
             let ctl = ctl()?;
@@ -491,7 +487,7 @@ impl DeviceImpl {
     }
     /// Retrieves the current MTU (Maximum Transmission Unit) for the interface.
     pub fn mtu(&self) -> std::io::Result<u16> {
-        let _guard = self.op_lock.read().unwrap();
+        let _guard = crate::platform::unix::read_operation_lock(&self.op_lock);
         unsafe {
             let mut req = self.request()?;
 
@@ -505,7 +501,7 @@ impl DeviceImpl {
     }
     /// Sets the MTU (Maximum Transmission Unit) for the interface.
     pub fn set_mtu(&self, value: u16) -> std::io::Result<()> {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         unsafe {
             let mut req = self.request()?;
             req.ifr_ifru.ifru_mtu = value as i32;
@@ -524,7 +520,7 @@ impl DeviceImpl {
         netmask: Netmask,
         destination: Option<IPv4>,
     ) -> io::Result<()> {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         let associate_route = self.associate_route.load(Ordering::Relaxed);
         self.set_network_address_impl(address, netmask, destination, associate_route)
     }
@@ -566,7 +562,7 @@ impl DeviceImpl {
         address: IPv4,
         netmask: Netmask,
     ) -> io::Result<()> {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         let associate_route = self.associate_route.load(Ordering::Relaxed);
         let addr = address.ipv4()?.into();
         let netmask = netmask.netmask()?.into();
@@ -575,7 +571,7 @@ impl DeviceImpl {
     }
     /// Removes an IP address from the interface.
     pub fn remove_address(&self, addr: IpAddr) -> io::Result<()> {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         unsafe {
             match addr {
                 IpAddr::V4(addr) => {
@@ -632,7 +628,7 @@ impl DeviceImpl {
         addr: IPv6,
         netmask: Netmask,
     ) -> io::Result<()> {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         let associate_route = self.associate_route.load(Ordering::Relaxed);
         self.add_address(
             addr.ipv6()?.into(),
@@ -647,7 +643,7 @@ impl DeviceImpl {
     /// into the hardware address field. It then applies the change via a system call.
     /// This operation is typically supported only for TAP devices.
     pub fn set_mac_address(&self, eth_addr: [u8; ETHER_ADDR_LEN as usize]) -> std::io::Result<()> {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         unsafe {
             let mut req = self.request()?;
             req.ifr_ifru.ifru_addr.sa_len = ETHER_ADDR_LEN;
@@ -665,7 +661,7 @@ impl DeviceImpl {
     /// This function queries the MAC address by the interface name using getifaddrs.
     /// An error is returned if the MAC address cannot be found.
     pub fn mac_address(&self) -> std::io::Result<[u8; ETHER_ADDR_LEN as usize]> {
-        let _guard = self.op_lock.read().unwrap();
+        let _guard = crate::platform::unix::read_operation_lock(&self.op_lock);
         let name = self.name_impl()?;
         let interfaces = getifaddrs::getifaddrs()?;
         for interface in interfaces {
@@ -684,7 +680,7 @@ impl DeviceImpl {
     /// family to all packets (same as NetBSD).
     /// If this is not enabled, the kernel silently drops all IPv6 packets on output and gets confused on input.
     pub fn enable_tunsifhead(&self) -> io::Result<()> {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         Self::enable_tunsifhead_impl(&self.tun.fd)
     }
 }

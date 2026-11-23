@@ -193,7 +193,7 @@ async fn test_udp_v4() {
     });
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    let udp_socket = tokio::net::UdpSocket::bind("10.26.1.200:0").await.unwrap();
+    let udp_socket = tokio::net::UdpSocket::bind("10.26.1.100:0").await.unwrap();
     udp_socket
         .send_to(test_msg.as_bytes(), "10.26.1.101:8080")
         .await
@@ -315,47 +315,50 @@ fn test_op() {
     #[cfg(target_os = "macos")]
     assert!(device.associate_route());
 
-    let vec = device.addresses().unwrap();
-    assert!(vec
-        .iter()
-        .any(|ip| *ip == "10.26.2.100".parse::<std::net::Ipv4Addr>().unwrap()));
-    assert!(vec.iter().any(|ip| *ip
-        == "fd12:3456:789a:5555:2222:3333:4444:5555"
-            .parse::<std::net::Ipv6Addr>()
-            .unwrap()));
+    #[cfg(feature = "address-management")]
+    {
+        let vec = device.addresses().unwrap();
+        assert!(vec
+            .iter()
+            .any(|ip| *ip == "10.26.2.100".parse::<std::net::Ipv4Addr>().unwrap()));
+        assert!(vec.iter().any(|ip| *ip
+            == "fd12:3456:789a:5555:2222:3333:4444:5555"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()));
 
-    device.set_network_address("10.26.3.200", 24, None).unwrap();
-    let vec = device.addresses().unwrap();
-    assert!(vec
-        .iter()
-        .any(|ip| *ip == "10.26.3.200".parse::<std::net::Ipv4Addr>().unwrap()));
-    assert!(vec.iter().any(|ip| *ip
-        == "fd12:3456:789a:5555:2222:3333:4444:5555"
-            .parse::<std::net::Ipv6Addr>()
-            .unwrap()));
-    assert!(!vec.contains(&"10.26.2.100".parse::<std::net::IpAddr>().unwrap()));
+        device.set_network_address("10.26.3.200", 24, None).unwrap();
+        let vec = device.addresses().unwrap();
+        assert!(vec
+            .iter()
+            .any(|ip| *ip == "10.26.3.200".parse::<std::net::Ipv4Addr>().unwrap()));
+        assert!(vec.iter().any(|ip| *ip
+            == "fd12:3456:789a:5555:2222:3333:4444:5555"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()));
+        assert!(!vec.contains(&"10.26.2.100".parse::<std::net::IpAddr>().unwrap()));
 
-    device.add_address_v4("10.6.0.1", 24).unwrap();
-    let vec = device.addresses().unwrap();
-    assert!(vec.contains(&"10.6.0.1".parse::<std::net::IpAddr>().unwrap()));
-    assert!(vec.contains(&"10.26.3.200".parse::<std::net::IpAddr>().unwrap()));
+        device.add_address_v4("10.6.0.1", 24).unwrap();
+        let vec = device.addresses().unwrap();
+        assert!(vec.contains(&"10.6.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(vec.contains(&"10.26.3.200".parse::<std::net::IpAddr>().unwrap()));
 
-    device
-        .remove_address("10.6.0.1".parse::<std::net::IpAddr>().unwrap())
-        .unwrap();
-    let vec = device.addresses().unwrap();
-    assert!(!vec.contains(&"10.6.0.1".parse::<std::net::IpAddr>().unwrap()));
-    assert!(vec.contains(&"10.26.3.200".parse::<std::net::IpAddr>().unwrap()));
+        device
+            .remove_address("10.6.0.1".parse::<std::net::IpAddr>().unwrap())
+            .unwrap();
+        let vec = device.addresses().unwrap();
+        assert!(!vec.contains(&"10.6.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(vec.contains(&"10.26.3.200".parse::<std::net::IpAddr>().unwrap()));
 
-    device
-        .add_address_v6("fdab:cdef:1234:5678:9abc:def0:1234:5678", 64)
-        .unwrap();
-    let vec = device.addresses().unwrap();
-    assert!(vec.contains(
-        &"fdab:cdef:1234:5678:9abc:def0:1234:5678"
-            .parse::<std::net::IpAddr>()
-            .unwrap()
-    ));
+        device
+            .add_address_v6("fdab:cdef:1234:5678:9abc:def0:1234:5678", 64)
+            .unwrap();
+        let vec = device.addresses().unwrap();
+        assert!(vec.contains(
+            &"fdab:cdef:1234:5678:9abc:def0:1234:5678"
+                .parse::<std::net::IpAddr>()
+                .unwrap()
+        ));
+    }
 
     device.enabled(true).unwrap();
 
@@ -431,6 +434,22 @@ fn create_tun() {
             assert_eq!(dev_name, name);
         }
     }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[test]
+fn adopted_raw_fd_rejects_virtio_header_framing() {
+    use std::io;
+    use std::os::fd::IntoRawFd;
+
+    let device = DeviceBuilder::new().offload(true).build_sync().unwrap();
+    let fd = device.into_raw_fd();
+
+    let error = match unsafe { SyncDevice::from_fd(fd) } {
+        Ok(_) => panic!("adopting an IFF_VNET_HDR descriptor unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
 #[cfg(any(
@@ -628,6 +647,18 @@ fn test_windows_new_apis() {
         .expect("clear_dns_servers (IPv6) should succeed");
 }
 
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[test]
+fn linux_rejects_packet_information_with_vnet_offload() {
+    let error = DeviceBuilder::new()
+        .packet_information(true)
+        .offload(true)
+        .build_sync()
+        .err()
+        .expect("unsupported PI + vnet-header combination was accepted");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
 /// Regression test for the device-wide TUN_F_* offload mask not being
 /// cleared on attach with `offload=false`.
 ///
@@ -653,6 +684,23 @@ fn test_offload_mask_cleared_on_reattach_without_offload() {
     use std::process::Command;
 
     const NAME: &str = "tunoffldclr";
+
+    struct TunLinkGuard<'a>(&'a str);
+
+    impl<'a> TunLinkGuard<'a> {
+        fn new(name: &'a str) -> Self {
+            let _ = Command::new("ip").args(["link", "delete", name]).status();
+            Self(name)
+        }
+    }
+
+    impl Drop for TunLinkGuard<'_> {
+        fn drop(&mut self) {
+            let _ = Command::new("ip").args(["link", "delete", self.0]).status();
+        }
+    }
+
+    let _cleanup = TunLinkGuard::new(NAME);
 
     // Parse `ethtool -k <name>` output for a single feature flag's state.
     // Lines look like:
@@ -686,9 +734,6 @@ fn test_offload_mask_cleared_on_reattach_without_offload() {
         panic!("feature `{feature}` not found in `ethtool -k {name}` output:\n{stdout}");
     }
 
-    // Clean any leftover device from a previous failed run. Ignore errors.
-    let _ = Command::new("ip").args(["link", "delete", NAME]).status();
-
     // ── Attach #1: offload=true, persisted ──────────────────────────────
     // Raises the device-wide TUN_F_* mask via TUNSETOFFLOAD.
     let dev1 = DeviceBuilder::new()
@@ -719,9 +764,6 @@ fn test_offload_mask_cleared_on_reattach_without_offload() {
     let csum_after_clear = ethtool_feature(NAME, "tx-checksum-ip-generic");
 
     drop(dev2);
-
-    // Cleanup before asserting so a failed assert doesn't leak the device.
-    let _ = Command::new("ip").args(["link", "delete", NAME]).status();
 
     assert!(
         tso_after_offload,

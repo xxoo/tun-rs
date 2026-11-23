@@ -17,19 +17,20 @@ impl FromRawFd for DeviceImpl {
     /// # Safety
     ///
     /// The caller must ensure that `fd` is a valid, open file descriptor for a TUN/TAP device.
+    /// On Linux, it must use `IFF_NO_PI` framing and must not use `IFF_VNET_HDR`.
     ///
     /// # Panics
     ///
-    /// This function will panic if the provided file descriptor is invalid or cannot be used
-    /// to create a TUN/TAP device. This is acceptable because providing an invalid fd violates
-    /// the safety contract of `FromRawFd`.
+    /// This function will panic if the provided file descriptor is invalid or violates the
+    /// platform-specific adoption contract.
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        // If this panics, the caller violated the safety contract by providing an invalid fd
-        DeviceImpl::from_fd(fd).expect(
-            "Failed to create device from file descriptor. \
-                                         The provided fd must be a valid, open file descriptor \
-                                         for a TUN/TAP device.",
-        )
+        // SAFETY: FromRawFd transfers ownership of a valid open descriptor to this object.
+        unsafe {
+            // If this panics, the caller violated the descriptor adoption safety contract.
+            DeviceImpl::from_fd(fd).expect(
+                "Failed to adopt TUN/TAP file descriptor; the descriptor must satisfy the platform-specific adoption contract",
+            )
+        }
     }
 }
 impl AsRawFd for DeviceImpl {
@@ -42,7 +43,12 @@ impl AsFd for DeviceImpl {
         unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }
-#[cfg(not(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")))]
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos"
+)))]
 impl std::os::unix::io::IntoRawFd for DeviceImpl {
     fn into_raw_fd(self) -> RawFd {
         self.tun.into_raw_fd()
@@ -51,17 +57,21 @@ impl std::os::unix::io::IntoRawFd for DeviceImpl {
 impl DeviceImpl {
     /// # Safety
     /// The fd passed in must be an owned file descriptor; in particular, it must be open.
+    /// On Linux, it must use `IFF_NO_PI` framing and must not use `IFF_VNET_HDR`.
     pub(crate) unsafe fn from_fd(fd: RawFd) -> io::Result<Self> {
-        let tun = Fd::new_unchecked(fd);
+        // SAFETY: from_fd's contract transfers ownership of a valid open descriptor.
+        let tun = unsafe { Fd::new_unchecked(fd) };
         DeviceImpl::from_tun(Tun::new(tun))
     }
     /// # Safety
     /// The fd passed in must be a valid, open file descriptor.
+    /// On Linux, it must use `IFF_NO_PI` framing and must not use `IFF_VNET_HDR`.
     /// Unlike [`from_fd`], this function does **not** take ownership of `fd`,
     /// and therefore will not close it when dropped.  
     /// The caller is responsible for ensuring the lifetime and eventual closure of `fd`.
     pub(crate) unsafe fn borrow_raw(fd: RawFd) -> io::Result<Self> {
-        let tun = Fd::new_unchecked_with_borrow(fd, true);
+        // SAFETY: borrow_raw's contract guarantees the externally owned descriptor stays valid.
+        let tun = unsafe { Fd::new_unchecked_with_borrow(fd, true) };
         DeviceImpl::from_tun(Tun::new(tun))
     }
     pub(crate) fn is_nonblocking(&self) -> io::Result<bool> {
@@ -156,6 +166,23 @@ impl DeviceImpl {
     target_os = "openbsd",
     target_os = "netbsd",
 ))]
+fn if_name_to_index(if_name: &std::ffi::CStr) -> io::Result<u32> {
+    // SAFETY: CStr guarantees a live NUL-terminated pointer for the call.
+    let index = unsafe { libc::if_nametoindex(if_name.as_ptr()) };
+    if index == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(index)
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+))]
 impl DeviceImpl {
     /// Retrieves the interface index for the network interface.
     ///
@@ -163,19 +190,27 @@ impl DeviceImpl {
     /// C-compatible string (CString) and then calls the libc function `if_nametoindex`
     /// to retrieve the corresponding interface index.
     pub fn if_index(&self) -> io::Result<u32> {
-        let _guard = self.op_lock.read().unwrap();
+        let _guard = crate::platform::unix::read_operation_lock(&self.op_lock);
         self.if_index_impl()
     }
     pub(crate) fn if_index_impl(&self) -> io::Result<u32> {
         let if_name = std::ffi::CString::new(self.name_impl()?)?;
-        unsafe { Ok(libc::if_nametoindex(if_name.as_ptr())) }
+        if_name_to_index(&if_name)
     }
     /// Retrieves all IP addresses associated with the network interface.
     ///
     /// This function calls `getifaddrs` with the interface name,
     /// then iterates over the returned list of interface addresses, extracting and collecting
     /// the IP addresses into a vector.
+    #[cfg(any(not(target_os = "linux"), feature = "address-management"))]
     pub fn addresses(&self) -> io::Result<Vec<std::net::IpAddr>> {
+        // OpenBSD reports netmasks with a truncated sockaddr that generic parsers may
+        // reject, dropping the whole entry; read the addresses directly instead.
+        #[cfg(target_os = "openbsd")]
+        {
+            return openbsd_addresses(&self.name_impl()?);
+        }
+        #[cfg(not(target_os = "openbsd"))]
         Ok(crate::platform::get_if_addrs_by_name(self.name_impl()?)?
             .iter()
             .filter_map(|v| v.address.ip_addr())
@@ -195,7 +230,7 @@ impl DeviceImpl {
     /// # Note
     /// Retrieve whether the packet is ignored for the TUN Device; The TAP device always returns `false`.
     pub fn ignore_packet_info(&self) -> bool {
-        let _guard = self.op_lock.read().unwrap();
+        let _guard = crate::platform::unix::read_operation_lock(&self.op_lock);
         self.tun.ignore_packet_info()
     }
     /// Sets whether the TUN device should ignore packet information (PI).
@@ -210,7 +245,7 @@ impl DeviceImpl {
     /// # Note
     /// This only works for a TUN device; The invocation will be ignored if the device is a TAP.
     pub fn set_ignore_packet_info(&self, ign: bool) {
-        let _guard = self.op_lock.write().unwrap();
+        let _guard = crate::platform::unix::write_operation_lock(&self.op_lock);
         self.tun.set_ignore_packet_info(ign)
     }
 }
@@ -221,12 +256,14 @@ impl DeviceImpl {
     target_os = "netbsd",
 ))]
 pub(crate) unsafe fn ctl() -> io::Result<Fd> {
-    Fd::new(libc::socket(AF_INET, SOCK_DGRAM | libc::SOCK_CLOEXEC, 0))
+    // SAFETY: libc::socket has no additional Rust-side memory-safety preconditions.
+    Fd::new(unsafe { libc::socket(AF_INET, SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) })
 }
 #[cfg(target_os = "macos")]
 pub(crate) unsafe fn ctl() -> io::Result<Fd> {
-    let fd = Fd::new(libc::socket(AF_INET, SOCK_DGRAM, 0))?;
-    _ = fd.set_cloexec();
+    // SAFETY: libc::socket has no additional Rust-side memory-safety preconditions.
+    let fd = Fd::new(unsafe { libc::socket(AF_INET, SOCK_DGRAM, 0) })?;
+    fd.set_cloexec()?;
     Ok(fd)
 }
 #[cfg(any(
@@ -236,20 +273,147 @@ pub(crate) unsafe fn ctl() -> io::Result<Fd> {
     target_os = "netbsd",
 ))]
 pub(crate) unsafe fn ctl_v6() -> io::Result<Fd> {
-    Fd::new(libc::socket(AF_INET6, SOCK_DGRAM | libc::SOCK_CLOEXEC, 0))
+    // SAFETY: libc::socket has no additional Rust-side memory-safety preconditions.
+    Fd::new(unsafe { libc::socket(AF_INET6, SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) })
 }
 #[cfg(target_os = "macos")]
 pub(crate) unsafe fn ctl_v6() -> io::Result<Fd> {
-    let fd = Fd::new(libc::socket(AF_INET6, SOCK_DGRAM, 0))?;
-    _ = fd.set_cloexec();
+    // SAFETY: libc::socket has no additional Rust-side memory-safety preconditions.
+    let fd = Fd::new(unsafe { libc::socket(AF_INET6, SOCK_DGRAM, 0) })?;
+    fd.set_cloexec()?;
     Ok(fd)
 }
 
-/// Helper function to safely copy a device name into a C buffer.
-/// This reduces code duplication across BSD platforms for setting interface names.
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd",))]
-pub(crate) unsafe fn copy_device_name(name: &str, dest: *mut libc::c_char, max_len: usize) {
-    use std::ptr;
-    let copy_len = name.len().min(max_len - 1);
-    ptr::copy_nonoverlapping(name.as_ptr() as *const libc::c_char, dest, copy_len);
+/// Copy a device name into a fixed-size C character buffer.
+///
+/// The destination is cleared and NUL-terminated. Names containing an interior NUL or
+/// requiring the entire destination (leaving no room for the terminator) are rejected.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    test
+))]
+pub(crate) fn copy_device_name(name: &str, dest: &mut [libc::c_char]) -> io::Result<()> {
+    let bytes = name.as_bytes();
+    if dest.is_empty() || bytes.len() >= dest.len() || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid or too-long network interface name",
+        ));
+    }
+
+    dest.fill(0);
+    for (slot, &byte) in dest[..bytes.len()].iter_mut().zip(bytes) {
+        *slot = libc::c_char::from_ne_bytes([byte]);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod copy_device_name_tests {
+    use super::copy_device_name;
+
+    fn bytes(buf: &[libc::c_char]) -> Vec<u8> {
+        buf.iter().map(|&value| value.to_ne_bytes()[0]).collect()
+    }
+
+    #[test]
+    fn rejects_empty_destination() {
+        let mut dest = [];
+        assert!(matches!(
+            copy_device_name("tun0", &mut dest),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn copies_and_nul_terminates() -> std::io::Result<()> {
+        let mut dest = [libc::c_char::MAX; 8];
+        copy_device_name("tun0", &mut dest)?;
+        assert_eq!(bytes(&dest), b"tun0\0\0\0\0");
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_largest_name_that_leaves_a_terminator() -> std::io::Result<()> {
+        let mut dest = [libc::c_char::MAX; 4];
+        copy_device_name("tun", &mut dest)?;
+        assert_eq!(bytes(&dest), b"tun\0");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_overlong_name_instead_of_truncating() {
+        let mut dest = [libc::c_char::MAX; 4];
+        assert!(matches!(
+            copy_device_name("tunnel", &mut dest),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn rejects_interior_nul() {
+        let mut dest = [libc::c_char::MAX; 8];
+        assert!(matches!(
+            copy_device_name("tun\0x", &mut dest),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    )
+))]
+mod if_index_tests {
+    use super::if_name_to_index;
+
+    #[test]
+    fn missing_interface_is_an_error_not_index_zero() {
+        assert!(if_name_to_index(c"tun-rs/definitely-invalid").is_err());
+    }
+}
+
+#[cfg(target_os = "openbsd")]
+fn openbsd_addresses(name: &str) -> io::Result<Vec<std::net::IpAddr>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut result = Vec::new();
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null()
+                || std::ffi::CStr::from_ptr(ifa.ifa_name).to_bytes() != name.as_bytes()
+            {
+                continue;
+            }
+            match (*ifa.ifa_addr).sa_family as libc::c_int {
+                libc::AF_INET => {
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    result.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                        sin.sin_addr.s_addr,
+                    ))));
+                }
+                libc::AF_INET6 => {
+                    let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    result.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                }
+                _ => {}
+            }
+        }
+        libc::freeifaddrs(head);
+    }
+    Ok(result)
 }

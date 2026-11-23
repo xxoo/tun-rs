@@ -113,8 +113,11 @@ let dev = DeviceBuilder::new()
     .ipv4("10.0.0.1", 24, None)
     .build_sync().unwrap();
 
-dev.add_address_v4("10.1.0.1", 24).unwrap();
-dev.add_address_v4("10.2.0.1", 24).unwrap();
+#[cfg(feature = "address-management")]
+{
+    dev.add_address_v4("10.1.0.1", 24).unwrap();
+    dev.add_address_v4("10.2.0.1", 24).unwrap();
+}
 dev.add_address_v6("CDCD:910A:2222:5498:8475:1111:3900:2021", 64).unwrap();
 # }
 ```
@@ -210,6 +213,7 @@ Common error scenarios include:
     target_os = "freebsd",
     target_os = "openbsd",
     target_os = "netbsd",
+    target_os = "illumos",
 ))]
 pub use crate::builder::*;
 pub use crate::platform::*;
@@ -229,6 +233,7 @@ pub use async_device::*;
     target_os = "freebsd",
     target_os = "openbsd",
     target_os = "netbsd",
+    target_os = "illumos",
 ))]
 mod builder;
 mod platform;

@@ -7,8 +7,28 @@ use crate::SyncDevice;
 use std::io;
 use std::io::{IoSlice, IoSliceMut};
 use std::ops::Deref;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+#[cfg(not(target_os = "illumos"))]
+use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
+/// Descriptor and waker helpers shared by the readiness tests.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(feature = "async_tokio", feature = "async_io")
+))]
+mod test_util;
+/// Readiness tests for the tokio backend.
+#[cfg(all(test, feature = "async_tokio", target_os = "linux"))]
+mod tests;
+/// Readiness tests for the async-io backend.
+#[cfg(all(
+    test,
+    feature = "async_io",
+    not(feature = "async_tokio"),
+    target_os = "linux"
+))]
+mod tests_async_io;
 #[cfg(feature = "async_tokio")]
 mod tokio;
 #[cfg(feature = "async_tokio")]
@@ -20,10 +40,18 @@ mod async_io;
 pub use self::async_io::AsyncDevice;
 
 impl FromRawFd for AsyncDevice {
+    /// # Safety
+    /// The fd must be valid, open, and refer to a TUN/TAP device.
+    /// On Linux, it must use `IFF_NO_PI` framing and must not use `IFF_VNET_HDR`.
+    ///
+    /// # Panics
+    /// Panics if the descriptor is invalid or violates the platform-specific adoption contract.
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        AsyncDevice::from_fd(fd).unwrap()
+        // SAFETY: FromRawFd transfers ownership of a valid open descriptor to this object.
+        unsafe { AsyncDevice::from_fd(fd) }.expect("failed to adopt TUN/TAP file descriptor")
     }
 }
+#[cfg(not(target_os = "illumos"))]
 impl IntoRawFd for AsyncDevice {
     fn into_raw_fd(self) -> RawFd {
         self.into_fd().unwrap()
@@ -50,22 +78,27 @@ impl AsyncDevice {
     }
 
     /// # Safety
-    /// This method is safe if the provided fd is valid
-    /// Construct a AsyncDevice from an existing file descriptor
+    /// The fd must be valid, open, and refer to a TUN/TAP device.
+    /// On Linux, it must use `IFF_NO_PI` framing and must not use `IFF_VNET_HDR`.
+    /// Construct an AsyncDevice from an existing file descriptor.
     pub unsafe fn from_fd(fd: RawFd) -> io::Result<AsyncDevice> {
-        AsyncDevice::new_dev(DeviceImpl::from_fd(fd)?)
+        // SAFETY: from_fd forwards its documented ownership and descriptor-validity contract.
+        AsyncDevice::new_dev(unsafe { DeviceImpl::from_fd(fd)? })
     }
 
     /// # Safety
     /// The fd passed in must be a valid, open file descriptor.
+    /// On Linux, it must use `IFF_NO_PI` framing and must not use `IFF_VNET_HDR`.
     /// Unlike [`from_fd`], this function does **not** take ownership of `fd`,
     /// and therefore will not close it when dropped.  
     /// The caller is responsible for ensuring the lifetime and eventual closure of `fd`.
     #[allow(dead_code)]
     pub(crate) unsafe fn borrow_raw(fd: RawFd) -> io::Result<Self> {
-        AsyncDevice::new_dev(DeviceImpl::borrow_raw(fd)?)
+        // SAFETY: borrow_raw forwards its documented borrowed-descriptor lifetime contract.
+        AsyncDevice::new_dev(unsafe { DeviceImpl::borrow_raw(fd)? })
     }
 
+    #[cfg(not(target_os = "illumos"))]
     pub fn into_fd(self) -> io::Result<RawFd> {
         Ok(self.into_device()?.into_raw_fd())
     }
@@ -76,6 +109,11 @@ impl AsyncDevice {
     /// The function may complete without the device being readable. This is a
     /// false-positive and attempting a `try_recv()` will return with
     /// `io::ErrorKind::WouldBlock`.
+    ///
+    /// On Linux with the tokio backend this also completes when the kernel
+    /// reports an error condition for the device (for example the interface
+    /// was deleted with `ip link del`); the following `try_recv()` then
+    /// returns that error instead of `WouldBlock`.
     ///
     /// # Cancel safety
     ///
@@ -111,7 +149,7 @@ impl AsyncDevice {
     /// # }
     /// ```
     pub async fn readable(&self) -> io::Result<()> {
-        self.0.readable().await.map(|_| ())
+        self.wait_readable().await
     }
     /// Waits for the device to become writable.
     ///
@@ -282,6 +320,56 @@ impl AsyncDevice {
             Ok(1)
         }
     }
+    /// Non-blocking variant of recv_multiple.
+    ///
+    /// Performs exactly one TUN read. When no packet is currently pending,
+    /// returns io::ErrorKind::WouldBlock.
+    #[cfg(target_os = "linux")]
+    pub fn try_recv_multiple<B: AsRef<[u8]> + AsMut<[u8]>>(
+        &self,
+        original_buffer: &mut [u8],
+        bufs: &mut [B],
+        sizes: &mut [usize],
+        offset: usize,
+    ) -> io::Result<usize> {
+        if bufs.is_empty() || bufs.len() != sizes.len() {
+            return Err(io::Error::other("bufs error"));
+        }
+        if bufs.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many packet buffers",
+            ));
+        }
+        let tun = self.get_ref();
+        if tun.vnet_hdr {
+            let len = self.try_recv(original_buffer)?;
+            if len <= VIRTIO_NET_HDR_LEN {
+                return Err(io::Error::other(format!(
+                    "length of packet ({len}) <= VIRTIO_NET_HDR_LEN ({VIRTIO_NET_HDR_LEN})"
+                )));
+            }
+            let hdr = VirtioNetHdr::decode(&original_buffer[..VIRTIO_NET_HDR_LEN])?;
+            tun.handle_virtio_read(
+                hdr,
+                &mut original_buffer[VIRTIO_NET_HDR_LEN..len],
+                bufs,
+                sizes,
+                offset,
+            )
+        } else {
+            let Some(buf) = bufs[0].as_mut().get_mut(offset..) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid offset",
+                ));
+            };
+            let len = self.try_recv(buf)?;
+            sizes[0] = len;
+            Ok(1)
+        }
+    }
+
     /// send multiple fragmented data packets.
     /// GROTable can be reused, as it is used to assist in data merging.
     /// Offset is the starting position of the data. Need to meet offset>10.

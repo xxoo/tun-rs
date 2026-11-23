@@ -8,7 +8,7 @@ use futures::Sink;
 use futures_core::Stream;
 
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-use crate::platform::offload::VirtioNetHdr;
+use crate::platform::offload::{GsoOutputCapacity, VirtioNetHdr};
 use crate::AsyncDevice;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use crate::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -118,8 +118,7 @@ impl<T: Encoder<Item>, Item> Encoder<Item> for &mut T {
 /// use tun_rs::async_framed::{BytesCodec, DeviceFramed};
 /// use tun_rs::DeviceBuilder;
 ///
-/// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
+/// # async fn example() -> std::io::Result<()> {
 ///     // Create a TUN device with IPv4 configuration
 ///     let dev = DeviceBuilder::new()
 ///         .name("tun0")
@@ -132,7 +131,7 @@ impl<T: Encoder<Item>, Item> Encoder<Item> for &mut T {
 ///
 ///     // Send a frame (Replace with real IP message)
 ///     let packet = b"[IP Packet: 10.0.0.1 -> 10.0.0.2] Hello, TUN!";
-///     framed.send(BytesMut::from(packet)).await?;
+///     framed.send(BytesMut::from(packet.as_slice())).await?;
 ///
 ///     // Receive frames
 ///     while let Some(frame) = framed.next().await {
@@ -142,7 +141,7 @@ impl<T: Encoder<Item>, Item> Encoder<Item> for &mut T {
 ///         }
 ///     }
 ///     Ok(())
-/// }
+/// # }
 /// ```
 pub struct DeviceFramed<C, T = AsyncDevice> {
     dev: T,
@@ -220,7 +219,8 @@ where
 
     /// Sets the size of the read buffer in bytes.
     ///
-    /// Must be at least as large as the MTU to ensure complete packet reception.
+    /// Values smaller than the automatically computed initial receive size are clamped
+    /// to that size. The initial size is derived from the device MTU and includes framing headroom.
     pub fn set_read_buffer_size(&mut self, read_buffer_size: usize) {
         self.r_state.set_read_buffer_size(read_buffer_size);
     }
@@ -263,7 +263,7 @@ where
     /// Split the framed device to read-half and write-half
     ///
     /// # Example
-    /// ```
+    /// ```no_run
     /// use std::net::Ipv4Addr;
     /// use std::sync::Arc;
     /// use tun_rs::{
@@ -276,6 +276,7 @@ where
     ///         .build_async()?,
     /// );
     /// let (r, w) = DeviceFramed::new(dev, BytesCodec::new()).split();
+    /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn split(self) -> (DeviceFramedRead<C, T>, DeviceFramedWrite<C, T>) {
         let dev = self.dev;
@@ -304,8 +305,7 @@ where
 /// use tun_rs::async_framed::{BytesCodec, DeviceFramedRead};
 /// use tun_rs::DeviceBuilder;
 ///
-/// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
+/// # async fn example() -> std::io::Result<()> {
 ///     // Create a TUN device with IPv4 configuration
 ///     let dev = DeviceBuilder::new()
 ///         .name("tun0")
@@ -324,7 +324,7 @@ where
 ///         }
 ///     }
 ///     Ok(())
-/// }
+/// # }
 /// ```
 ///
 /// See [`DeviceFramed`] for a unified read/write interface.
@@ -341,7 +341,7 @@ where
     ///
     /// The read side of the framed device.
     /// # Example
-    /// ```
+    /// ```no_run
     /// use std::net::Ipv4Addr;
     /// use std::sync::Arc;
     /// use tun_rs::{
@@ -355,6 +355,7 @@ where
     /// );
     /// let mut w = DeviceFramedWrite::new(dev.clone(), BytesCodec::new());
     /// let mut r = DeviceFramedRead::new(dev, BytesCodec::new());
+    /// # Ok::<(), std::io::Error>(())
     /// ```
     /// # Note
     /// An efficient way is to directly use [`DeviceFramed::split`] if the device is cloneable
@@ -375,7 +376,8 @@ where
     }
     /// Sets the size of the read buffer in bytes.
     ///
-    /// Must be at least as large as the MTU to ensure complete packet reception.
+    /// Values smaller than the automatically computed initial receive size are clamped
+    /// to that size. The initial size is derived from the device MTU and includes framing headroom.
     pub fn set_read_buffer_size(&mut self, read_buffer_size: usize) {
         self.state.set_read_buffer_size(read_buffer_size);
     }
@@ -417,8 +419,7 @@ where
 /// use tun_rs::async_framed::{BytesCodec, DeviceFramedWrite};
 /// use tun_rs::DeviceBuilder;
 ///
-/// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
+/// # async fn example() -> std::io::Result<()> {
 ///     // Create a TUN device with IPv4 configuration
 ///     let dev = DeviceBuilder::new()
 ///         .name("tun0")
@@ -431,10 +432,10 @@ where
 ///
 ///     // Send a frame (Replace with real IP message)
 ///     let packet = b"[IP Packet: 10.0.0.1 -> 10.0.0.2] Hello, TUN!";
-///     framed_write.send(BytesMut::from(packet)).await?;
+///     framed_write.send(BytesMut::from(packet.as_slice())).await?;
 ///
 ///     Ok(())
-/// }
+/// # }
 /// ```
 pub struct DeviceFramedWrite<C, T = AsyncDevice> {
     dev: T,
@@ -449,7 +450,7 @@ where
     ///
     /// The write side of the framed device.
     /// # Example
-    /// ```
+    /// ```no_run
     /// use std::net::Ipv4Addr;
     /// use std::sync::Arc;
     /// use tun_rs::{
@@ -463,6 +464,7 @@ where
     /// );
     /// let mut w = DeviceFramedWrite::new(dev.clone(), BytesCodec::new());
     /// let mut r = DeviceFramedRead::new(dev, BytesCodec::new());
+    /// # Ok::<(), std::io::Error>(())
     /// ```
     /// # Note
     /// An efficient way is to directly use [`DeviceFramed::split`] if the device is cloneable
@@ -532,15 +534,15 @@ where
 fn compute_buffer_size<T: Borrow<AsyncDevice>>(_dev: &T) -> usize {
     // The interface MTU covers only the L3 payload. In TAP (Layer::L2) mode the
     // device delivers complete Ethernet frames, which exceed the MTU by the
-    // Ethernet header (14 bytes) — plus 4 bytes when the frame carries an
-    // IEEE 802.1Q VLAN tag (double-tagged QinQ frames would need 8). Sizing the
-    // buffer to the raw MTU would reject almost every TAP packet ("receive
-    // buffer too small"); always add the header + VLAN overhead so the same
-    // default works for both TUN and TAP (for TUN this only costs a few extra
-    // bytes).
+    // Ethernet header (14 bytes) plus up to two 4-byte VLAN tags. Two tags
+    // cover IEEE 802.1ad QinQ frames; TAP delivers those tag bytes in-band, so
+    // sizing for only one tag can truncate an otherwise MTU-sized double-tagged
+    // frame. The same conservative default is used for TUN, where the extra
+    // bytes are harmless.
     const ETHERNET_HEADER_LEN: usize = 14;
     const VLAN_TAG_LEN: usize = 4;
-    const FRAME_OVERHEAD: usize = ETHERNET_HEADER_LEN + VLAN_TAG_LEN;
+    const MAX_VLAN_TAGS: usize = 2;
+    const FRAME_OVERHEAD: usize = ETHERNET_HEADER_LEN + VLAN_TAG_LEN * MAX_VLAN_TAGS;
 
     #[cfg(any(
         target_os = "windows",
@@ -571,6 +573,7 @@ fn compute_buffer_size<T: Borrow<AsyncDevice>>(_dev: &T) -> usize {
 }
 struct ReadState {
     recv_buffer_size: usize,
+    min_recv_buffer_size: usize,
     rd: BytesMut,
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     packet_splitter: Option<PacketSplitter>,
@@ -586,6 +589,7 @@ impl ReadState {
 
         ReadState {
             recv_buffer_size,
+            min_recv_buffer_size: recv_buffer_size,
             rd: BytesMut::with_capacity(recv_buffer_size),
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             packet_splitter,
@@ -597,10 +601,11 @@ impl ReadState {
     }
 
     pub(crate) fn set_read_buffer_size(&mut self, read_buffer_size: usize) {
-        self.recv_buffer_size = read_buffer_size;
+        let effective_size = read_buffer_size.max(self.min_recv_buffer_size);
+        self.recv_buffer_size = effective_size;
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(packet_splitter) = &mut self.packet_splitter {
-            packet_splitter.set_recv_buffer_size(read_buffer_size);
+            packet_splitter.set_recv_buffer_size(effective_size);
         }
     }
 }
@@ -693,6 +698,11 @@ struct PacketSplitter {
     recv_num: usize,
     recv_buffer_size: usize,
 }
+// Keep the normal 128-packet pool. Additional segment data is temporary and bounded
+// independently of MTU, so small gso_size values do not allocate an MTU per segment.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+const MAX_GSO_OVERFLOW_BYTES: usize = 8 * 1024 * 1024;
+
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl PacketSplitter {
     fn new(recv_buffer_size: usize) -> PacketSplitter {
@@ -707,6 +717,24 @@ impl PacketSplitter {
         }
     }
     fn handle(&mut self, dev: &AsyncDevice, input: &mut [u8]) -> io::Result<()> {
+        self.handle_with(input, |hdr, input, bufs, sizes| {
+            dev.handle_virtio_read(hdr, input, bufs, sizes, 0)
+        })
+    }
+    fn handle_with(
+        &mut self,
+        input: &mut [u8],
+        mut split: impl FnMut(
+            VirtioNetHdr,
+            &mut [u8],
+            &mut [BytesMut],
+            &mut [usize],
+        ) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        self.recv_index = 0;
+        self.recv_num = 0;
+        self.bufs.truncate(IDEAL_BATCH_SIZE);
+        self.sizes.truncate(IDEAL_BATCH_SIZE);
         if input.len() <= VIRTIO_NET_HDR_LEN {
             Err(io::Error::other(format!(
                 "length of packet ({}) <= VIRTIO_NET_HDR_LEN ({VIRTIO_NET_HDR_LEN})",
@@ -717,13 +745,52 @@ impl PacketSplitter {
             buf.resize(self.recv_buffer_size, 0);
         }
         let hdr = VirtioNetHdr::decode(&input[..VIRTIO_NET_HDR_LEN])?;
-        let num = dev.handle_virtio_read(
+        let result = split(
             hdr,
             &mut input[VIRTIO_NET_HDR_LEN..],
             &mut self.bufs,
             &mut self.sizes,
-            0,
-        )?;
+        );
+        let num = match result {
+            Ok(num) => num,
+            Err(error) => {
+                let Some(capacity) = error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<GsoOutputCapacity>())
+                    .copied()
+                else {
+                    return Err(error);
+                };
+                if capacity.segments > usize::from(u16::MAX)
+                    || capacity.segment_len > self.recv_buffer_size
+                {
+                    return Err(error);
+                }
+                let extra = capacity.segments - self.bufs.len();
+                let bytes = extra
+                    .checked_mul(capacity.segment_len)
+                    .filter(|&bytes| bytes <= MAX_GSO_OVERFLOW_BYTES)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "GSO output exceeds framed reader overflow budget",
+                        )
+                    })?;
+                // gso_split reports capacity only after validating the metadata,
+                // before modifying either input or output. Retry that record once.
+                let mut overflow = BytesMut::zeroed(bytes);
+                for _ in 0..extra {
+                    self.bufs.push(overflow.split_to(capacity.segment_len));
+                }
+                self.sizes.resize(capacity.segments, 0);
+                split(
+                    hdr,
+                    &mut input[VIRTIO_NET_HDR_LEN..],
+                    &mut self.bufs,
+                    &mut self.sizes,
+                )?
+            }
+        };
 
         for i in 0..num {
             self.bufs[i].truncate(self.sizes[i]);
@@ -734,6 +801,8 @@ impl PacketSplitter {
     }
     fn next(&mut self) -> Option<&mut BytesMut> {
         if self.recv_index >= self.recv_num {
+            self.bufs.truncate(IDEAL_BATCH_SIZE);
+            self.sizes.truncate(IDEAL_BATCH_SIZE);
             None
         } else {
             let buf = &mut self.bufs[self.recv_index];
@@ -743,6 +812,170 @@ impl PacketSplitter {
     }
     fn set_recv_buffer_size(&mut self, recv_buffer_size: usize) {
         self.recv_buffer_size = recv_buffer_size;
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(target_env = "ohos")))]
+mod splitter_tests {
+    use super::*;
+    use crate::platform::offload::VIRTIO_NET_HDR_F_NEEDS_CSUM;
+    use crate::{gso_split, VIRTIO_NET_HDR_GSO_TCPV6};
+
+    fn record(segments: usize, size: u16) -> Vec<u8> {
+        let payload_len = segments * usize::from(size);
+        let mut input = vec![0; VIRTIO_NET_HDR_LEN + 60 + payload_len];
+        VirtioNetHdr {
+            flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+            gso_type: VIRTIO_NET_HDR_GSO_TCPV6,
+            hdr_len: 60,
+            gso_size: size,
+            csum_start: 40,
+            csum_offset: 16,
+        }
+        .encode(&mut input[..VIRTIO_NET_HDR_LEN])
+        .unwrap();
+        let packet = &mut input[VIRTIO_NET_HDR_LEN..];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&u16::try_from(20 + payload_len).unwrap().to_be_bytes());
+        packet[6] = 6;
+        packet[7] = 64;
+        packet[8] = 0xfd;
+        packet[23] = 1;
+        packet[24] = 0xfd;
+        packet[39] = 2;
+        packet[40..42].copy_from_slice(&10000u16.to_be_bytes());
+        packet[42..44].copy_from_slice(&22u16.to_be_bytes());
+        packet[44..48].copy_from_slice(&1u32.to_be_bytes());
+        packet[52] = 0x50;
+        packet[53] = 0x19;
+        packet[54..56].copy_from_slice(&65535u16.to_be_bytes());
+        packet[60..].fill(0x5a);
+        input
+    }
+
+    fn split(
+        hdr: VirtioNetHdr,
+        input: &mut [u8],
+        bufs: &mut [BytesMut],
+        sizes: &mut [usize],
+    ) -> io::Result<usize> {
+        gso_split(input, hdr, bufs, sizes, 0, true)
+    }
+
+    fn verify(splitter: &mut PacketSplitter, segments: usize, size: u16) {
+        for index in 0..segments {
+            let packet = splitter.next().expect("missing segment");
+            assert_eq!(packet.len(), 60 + usize::from(size));
+            assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), 20 + size);
+            assert_eq!(
+                u32::from_be_bytes(packet[44..48].try_into().unwrap()),
+                1 + (index * usize::from(size)) as u32
+            );
+            assert_eq!(
+                packet[53] & 0x09,
+                if index + 1 == segments { 0x09 } else { 0 }
+            );
+            assert!(packet[60..].iter().all(|&byte| byte == 0x5a));
+        }
+        assert!(splitter.next().is_none());
+        assert_eq!(splitter.bufs.len(), IDEAL_BATCH_SIZE);
+        assert_eq!(splitter.sizes.len(), IDEAL_BATCH_SIZE);
+    }
+
+    #[test]
+    fn framed_splitter_accepts_more_than_128_segments() {
+        for segments in [128, 129, 1300] {
+            let mut splitter = PacketSplitter::new(1500);
+            splitter
+                .handle_with(&mut record(segments, 48), split)
+                .unwrap();
+            verify(&mut splitter, segments, 48);
+            splitter.handle_with(&mut record(2, 1440), split).unwrap();
+            verify(&mut splitter, 2, 1440);
+        }
+    }
+
+    #[test]
+    fn framed_splitter_keeps_mtu_limit_and_can_read_next_record() {
+        let mut splitter = PacketSplitter::new(100);
+        assert!(splitter.handle_with(&mut record(129, 48), split).is_err());
+        assert!(splitter.next().is_none());
+        splitter.handle_with(&mut record(2, 32), split).unwrap();
+        verify(&mut splitter, 2, 32);
+    }
+
+    #[test]
+    fn framed_splitter_rejects_invalid_metadata_without_growing() {
+        let mut splitter = PacketSplitter::new(1500);
+        let mut input = record(129, 48);
+        let mut hdr = VirtioNetHdr::decode(&input[..VIRTIO_NET_HDR_LEN]).unwrap();
+        hdr.gso_size = 0;
+        hdr.encode(&mut input[..VIRTIO_NET_HDR_LEN]).unwrap();
+        let before = input.clone();
+        assert!(splitter.handle_with(&mut input, split).is_err());
+        assert_eq!(input, before);
+        assert_eq!(splitter.bufs.len(), IDEAL_BATCH_SIZE);
+        assert!(splitter.next().is_none());
+    }
+
+    #[test]
+    fn framed_splitter_bounds_overflow_before_allocation() {
+        let mut splitter = PacketSplitter::new(4096);
+        let error = splitter
+            .handle_with(&mut record(2, 48), |_, _, _, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    GsoOutputCapacity {
+                        segments: 5000,
+                        segment_len: 2049,
+                    },
+                ))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("overflow budget"));
+        assert_eq!(splitter.bufs.len(), IDEAL_BATCH_SIZE);
+        assert!(splitter.next().is_none());
+        splitter.handle_with(&mut record(2, 48), split).unwrap();
+        verify(&mut splitter, 2, 48);
+    }
+
+    #[test]
+    fn framed_splitter_preserves_unrelated_errors() {
+        let mut splitter = PacketSplitter::new(1500);
+        let mut calls = 0;
+        let error = splitter
+            .handle_with(&mut record(2, 48), |_, _, _, _| {
+                calls += 1;
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "bad record"))
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.to_string(), "bad record");
+        assert_eq!(splitter.bufs.len(), IDEAL_BATCH_SIZE);
+        assert!(splitter.next().is_none());
+    }
+
+    #[test]
+    fn gso_capacity_hint_preserves_input_and_output() {
+        let mut record = record(129, 48);
+        let hdr = VirtioNetHdr::decode(&record[..VIRTIO_NET_HDR_LEN]).unwrap();
+        let input = &mut record[VIRTIO_NET_HDR_LEN..];
+        let original = input.to_vec();
+        let mut bufs = vec![BytesMut::zeroed(1500); IDEAL_BATCH_SIZE];
+        let mut sizes = vec![0; IDEAL_BATCH_SIZE];
+        let error = split(hdr, input, &mut bufs, &mut sizes).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "too many GSO segments");
+        let capacity = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<GsoOutputCapacity>()
+            .unwrap();
+        assert_eq!(capacity.segments, 129);
+        assert_eq!(capacity.segment_len, 108);
+        assert_eq!(input, original);
+        assert!(bufs.iter().all(|buf| buf.iter().all(|&byte| byte == 0)));
+        assert!(sizes.iter().all(|&size| size == 0));
     }
 }
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -974,5 +1207,96 @@ where
     {
         ready!(self.poll_flush(cx))?;
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod read_buffer_size_tests {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    use super::PacketSplitter;
+    use super::{BytesMut, ReadState};
+
+    fn state_with_minimum(minimum: usize) -> ReadState {
+        ReadState {
+            recv_buffer_size: minimum,
+            min_recv_buffer_size: minimum,
+            rd: BytesMut::new(),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            packet_splitter: Some(PacketSplitter::new(minimum)),
+        }
+    }
+
+    #[test]
+    fn read_buffer_size_clamps_below_initial_minimum() {
+        let mut state = state_with_minimum(1_522);
+
+        state.set_read_buffer_size(1_500);
+
+        assert_eq!(state.read_buffer_size(), 1_522);
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        assert_eq!(
+            state
+                .packet_splitter
+                .as_ref()
+                .map(|splitter| splitter.recv_buffer_size),
+            Some(1_522)
+        );
+    }
+
+    #[test]
+    fn read_buffer_size_accepts_growth_and_later_shrink_to_minimum() {
+        let mut state = state_with_minimum(1_522);
+
+        state.set_read_buffer_size(9_000);
+        assert_eq!(state.read_buffer_size(), 9_000);
+
+        state.set_read_buffer_size(1_522);
+        assert_eq!(state.read_buffer_size(), 1_522);
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    not(target_env = "ohos"),
+    feature = "async_tokio"
+))]
+mod framed_buffer_tests {
+    use super::{BytesCodec, DeviceFramedRead};
+    use crate::platform::DeviceImpl;
+    use crate::AsyncDevice;
+    use futures::StreamExt;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixDatagram;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn qinq_mtu_boundary_is_not_truncated() {
+        // A test descriptor has no interface MTU, so the framed reader takes
+        // compute_buffer_size's 4096-byte fallback. Add exactly the L2 bytes
+        // required by an Ethernet frame carrying two VLAN tags. If the QinQ
+        // allowance regresses from 22 to the old 18 bytes, recv truncates this
+        // datagram and the byte-for-byte assertion below fails.
+        const FALLBACK_MTU: usize = 4096;
+        const QINQ_FRAME_LEN: usize = FALLBACK_MTU + 14 + 2 * 4;
+
+        let (device_socket, peer) = UnixDatagram::pair().expect("create datagram pair");
+        let device =
+            AsyncDevice::new_dev(DeviceImpl::from_fd_for_test(device_socket.into_raw_fd()))
+                .expect("register async device");
+        let mut framed = DeviceFramedRead::new(device, BytesCodec::new());
+        let frame = vec![0x5a; QINQ_FRAME_LEN];
+
+        assert_eq!(
+            peer.send(&frame).expect("send QinQ-sized frame"),
+            frame.len()
+        );
+        let received = framed
+            .next()
+            .await
+            .expect("framed stream ended")
+            .expect("read framed packet");
+
+        assert_eq!(received.len(), QINQ_FRAME_LEN);
+        assert_eq!(&received[..], &frame);
     }
 }

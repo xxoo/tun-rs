@@ -3,7 +3,7 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
 use std::{io, mem, ptr};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR,
+    ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2,
@@ -14,7 +14,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     MIB_UNICASTIPADDRESS_TABLE,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    NlroManual, AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
+    IpDadStatePreferred, NlroManual, AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
 };
 use windows_sys::Win32::System::Threading::{ResetEvent, SetEvent};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -34,6 +34,7 @@ use windows_sys::{
         },
         Foundation::{
             CloseHandle, GetLastError, ERROR_NO_MORE_ITEMS, FALSE, FILETIME, HANDLE, TRUE,
+            WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         NetworkManagement::{
             IpHelper::{
@@ -83,6 +84,15 @@ pub fn decode_utf16(string: &[u16]) -> String {
     String::from_utf16_lossy(&string[..end])
 }
 
+pub(crate) fn finite_wait_timeout_millis(duration: std::time::Duration) -> u32 {
+    let whole_millis = duration.as_millis();
+    let has_fraction = duration.subsec_nanos() != duration.subsec_millis() * 1_000_000;
+    let rounded_up = whole_millis.saturating_add(u128::from(has_fraction));
+    let max_finite = u128::from(windows_sys::Win32::System::Threading::INFINITE - 1);
+    u32::try_from(rounded_up.min(max_finite))
+        .unwrap_or(windows_sys::Win32::System::Threading::INFINITE - 1)
+}
+
 pub fn string_from_guid(guid: &GUID) -> io::Result<String> {
     let mut string = vec![0; 39];
 
@@ -95,35 +105,31 @@ pub fn string_from_guid(guid: &GUID) -> io::Result<String> {
 pub fn alias_to_luid(alias: &str) -> io::Result<NET_LUID_LH> {
     let alias = encode_utf16(alias);
     let mut luid = unsafe { mem::zeroed() };
-    match unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) } {
-        0 => Ok(luid),
-        _err => Err(io::Error::last_os_error()),
-    }
+    let status = unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) };
+    win_result(status)?;
+    Ok(luid)
 }
 
 pub fn luid_to_index(luid: &NET_LUID_LH) -> io::Result<u32> {
     let mut index = 0;
-    match unsafe { ConvertInterfaceLuidToIndex(luid, &mut index) } {
-        0 => Ok(index),
-        _err => Err(io::Error::last_os_error()),
-    }
+    let status = unsafe { ConvertInterfaceLuidToIndex(luid, &mut index) };
+    win_result(status)?;
+    Ok(index)
 }
 
 pub fn luid_to_guid(luid: &NET_LUID_LH) -> io::Result<GUID> {
     let mut guid = unsafe { mem::zeroed() };
-    match unsafe { ConvertInterfaceLuidToGuid(luid, &mut guid) } {
-        0 => Ok(guid),
-        _err => Err(io::Error::last_os_error()),
-    }
+    let status = unsafe { ConvertInterfaceLuidToGuid(luid, &mut guid) };
+    win_result(status)?;
+    Ok(guid)
 }
 
 pub fn luid_to_alias(luid: &NET_LUID_LH) -> io::Result<String> {
     // IF_MAX_STRING_SIZE + 1
     let mut alias = vec![0; 257];
-    match unsafe { ConvertInterfaceLuidToAlias(luid, alias.as_mut_ptr(), alias.len()) } {
-        0 => Ok(decode_utf16(&alias)),
-        _err => Err(io::Error::last_os_error()),
-    }
+    let status = unsafe { ConvertInterfaceLuidToAlias(luid, alias.as_mut_ptr(), alias.len()) };
+    win_result(status)?;
+    Ok(decode_utf16(&alias))
 }
 pub fn reset_event(handle: RawHandle) -> io::Result<()> {
     unsafe {
@@ -134,12 +140,15 @@ pub fn reset_event(handle: RawHandle) -> io::Result<()> {
     Ok(())
 }
 pub fn wait_for_single_object(handle: RawHandle, timeout: u32) -> io::Result<()> {
-    unsafe {
-        if 0 == WaitForSingleObject(handle, timeout) {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+    // SAFETY: callers supply a live waitable handle; WaitForSingleObject borrows
+    // the handle synchronously and does not alter its ownership.
+    match unsafe { WaitForSingleObject(handle, timeout) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => Err(io::Error::from(io::ErrorKind::TimedOut)),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        value => Err(io::Error::other(format!(
+            "WaitForSingleObject returned unexpected status {value:#x}"
+        ))),
     }
 }
 pub fn set_event(handle: RawHandle) -> io::Result<()> {
@@ -179,7 +188,7 @@ pub fn create_file(
             ptr::null_mut(),
         )
     };
-    if handle.is_null() {
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
         Err(io::Error::last_os_error())
     } else {
         Ok(handle)
@@ -528,25 +537,27 @@ pub fn notify_change_key_value(
     notify_filter: u32,
     milliseconds: u32,
 ) -> io::Result<()> {
-    const INVALID_HANDLE_VALUE: HKEY = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE as _;
+    let event = unsafe { CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null()) };
+    if event.is_null() {
+        return Err(io::Error::last_os_error());
+    }
 
-    let event = match unsafe { CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null()) } {
-        INVALID_HANDLE_VALUE => Err(io::Error::last_os_error()),
-        event => Ok(event),
-    }?;
-
-    let result =
-        match unsafe { RegNotifyChangeKeyValue(key, watch_subtree, notify_filter, event, TRUE) } {
-            0 => match unsafe { WaitForSingleObject(event, milliseconds) } {
-                0 => Ok(()),
-                0x102 => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Registry timed out",
-                )),
-                _ => Err(io::Error::last_os_error()),
-            },
-            _err => Err(io::Error::last_os_error()),
-        };
+    let notify_status =
+        unsafe { RegNotifyChangeKeyValue(key, watch_subtree, notify_filter, event, TRUE) };
+    let result = if notify_status == 0 {
+        match unsafe { WaitForSingleObject(event, milliseconds) } {
+            windows_sys::Win32::Foundation::WAIT_OBJECT_0 => Ok(()),
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => {
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            }
+            windows_sys::Win32::Foundation::WAIT_FAILED => Err(io::Error::last_os_error()),
+            value => Err(io::Error::other(format!(
+                "WaitForSingleObject returned unexpected status {value:#x}"
+            ))),
+        }
+    } else {
+        Err(io::Error::from_raw_os_error(notify_status as i32))
+    };
 
     unsafe { CloseHandle(event) };
 
@@ -614,14 +625,18 @@ pub fn device_io_control(
     }
 }
 
+fn get_ip_interface_table(family: u16) -> io::Result<*mut MIB_IPINTERFACE_TABLE> {
+    let mut if_table: *mut MIB_IPINTERFACE_TABLE = ptr::null_mut();
+    let status = unsafe { GetIpInterfaceTable(family, &mut if_table) };
+    win_result(status)?;
+    Ok(if_table)
+}
+
 pub fn get_mtu_by_index(index: u32, is_v4: bool) -> io::Result<u32> {
     // https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getipinterfacetable#examples
-    let mut if_table: *mut MIB_IPINTERFACE_TABLE = ptr::null_mut();
+    let if_table = get_ip_interface_table(if is_v4 { AF_INET } else { AF_INET6 })?;
     let mut mtu = None;
     unsafe {
-        if GetIpInterfaceTable(if is_v4 { AF_INET } else { AF_INET6 }, &mut if_table) != NO_ERROR {
-            return Err(io::Error::last_os_error());
-        }
         let ifaces = std::slice::from_raw_parts::<MIB_IPINTERFACE_ROW>(
             &(*if_table).Table[0],
             (*if_table).NumEntries as usize,
@@ -667,14 +682,30 @@ pub(crate) fn win_result(code: u32) -> io::Result<()> {
 }
 
 /// Sets the interface metric (routing cost) for both IPv4 and IPv6 by interface index.
+///
+/// On systems where IPv6 is disabled (e.g. via `Tcpip6\Parameters\DisabledComponents`),
+/// a newly created adapter has no IPv6 interface row. `GetIpInterfaceEntry(AF_INET6)`
+/// returns `ERROR_NOT_FOUND` (1168), which previously caused the entire call to fail
+/// even though the IPv4 metric was set successfully. This function now skips address
+/// families whose interface row does not exist, so IPv4-only operation is not blocked.
+/// If neither address family has an interface row, an error is returned instead of a
+/// silent no-op.
 pub fn set_interface_metric(index: u32, metric: u32) -> io::Result<()> {
+    let mut updated = false;
     for family in [AF_INET, AF_INET6] {
         let mut row = MIB_IPINTERFACE_ROW {
             Family: family,
             InterfaceIndex: index,
             ..Default::default()
         };
-        win_result(unsafe { GetIpInterfaceEntry(&mut row) })?;
+        // Skip address families that have no interface row on this adapter.
+        // This happens when IPv6 is disabled system-wide; the IPv4 metric is
+        // still applied below.
+        match unsafe { GetIpInterfaceEntry(&mut row) } {
+            NO_ERROR => {}
+            ERROR_NOT_FOUND => continue,
+            code => return win_result(code),
+        }
 
         row.Metric = metric;
         row.UseAutomaticMetric = false;
@@ -682,6 +713,10 @@ pub fn set_interface_metric(index: u32, metric: u32) -> io::Result<()> {
         // `SetIpInterfaceEntry` rejects when writing the row back.
         row.SitePrefixLength = 0;
         win_result(unsafe { SetIpInterfaceEntry(&mut row) })?;
+        updated = true;
+    }
+    if !updated {
+        return Err(io::Error::from_raw_os_error(ERROR_NOT_FOUND as i32));
     }
     Ok(())
 }
@@ -716,6 +751,9 @@ pub fn add_address(
     row.InterfaceIndex = index;
     row.Address = sockaddr_inet_from_ip(address);
     row.OnLinkPrefixLength = prefix;
+    // Mark the address preferred so it is usable immediately instead of waiting for
+    // duplicate address detection, which would make `bind` fail for a few seconds.
+    row.DadState = IpDadStatePreferred;
 
     let code = unsafe { CreateUnicastIpAddressEntry(&row) };
     if code != ERROR_OBJECT_ALREADY_EXISTS {
@@ -861,4 +899,167 @@ pub fn set_device_state(
     }
 
     call_class_installer(devinfo, devinfo_data, DIF_PROPERTYCHANGE)
+}
+
+#[cfg(test)]
+mod wait_semantics_tests {
+    use super::{create_event, finite_wait_timeout_millis, wait_for_single_object};
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+    use std::time::Duration;
+    use windows_sys::Win32::System::Threading::INFINITE;
+
+    #[test]
+    fn finite_wait_timeout_rounds_up_without_aliasing_infinite() {
+        assert_eq!(finite_wait_timeout_millis(Duration::ZERO), 0);
+        assert_eq!(finite_wait_timeout_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(finite_wait_timeout_millis(Duration::from_micros(1001)), 2);
+        assert_eq!(
+            finite_wait_timeout_millis(Duration::from_millis(u64::from(INFINITE))),
+            INFINITE - 1
+        );
+    }
+
+    #[test]
+    fn unsignalled_event_reports_timeout() -> io::Result<()> {
+        let event = create_event()?;
+        let error = wait_for_single_object(event.as_raw_handle(), 0)
+            .err()
+            .ok_or_else(|| io::Error::other("unsignalled event unexpectedly became ready"))?;
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod netio_status_tests {
+    use super::{get_ip_interface_table, luid_to_index};
+    use std::io;
+    use windows_sys::Win32::NetworkManagement::{
+        IpHelper::{ConvertInterfaceLuidToIndex, FreeMibTable, GetIpInterfaceTable},
+        Ndis::NET_LUID_LH,
+    };
+
+    #[test]
+    fn ip_interface_table_uses_returned_status_not_stale_last_error() -> io::Result<()> {
+        const STALE_LAST_ERROR: u32 = 0x1234;
+        const INVALID_FAMILY: u16 = u16::MAX;
+        let mut direct_table = std::ptr::null_mut();
+
+        let direct_status = unsafe { GetIpInterfaceTable(INVALID_FAMILY, &mut direct_table) };
+        if direct_status == 0 {
+            unsafe { FreeMibTable(direct_table.cast()) };
+            return Err(io::Error::other(
+                "invalid address family unexpectedly produced an interface table",
+            ));
+        }
+
+        unsafe { windows_sys::Win32::Foundation::SetLastError(STALE_LAST_ERROR) };
+        let error = get_ip_interface_table(INVALID_FAMILY)
+            .err()
+            .ok_or_else(|| io::Error::other("invalid address family unexpectedly succeeded"))?;
+
+        assert_eq!(
+            error.raw_os_error(),
+            Some(direct_status as i32),
+            "wrapper did not preserve GetIpInterfaceTable's returned status"
+        );
+        assert_ne!(
+            error.raw_os_error(),
+            Some(STALE_LAST_ERROR as i32),
+            "wrapper returned stale GetLastError instead of GetIpInterfaceTable status"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn netio_wrapper_uses_returned_status_not_stale_last_error() -> io::Result<()> {
+        const STALE_LAST_ERROR: u32 = 0x1234;
+        let luid = NET_LUID_LH { Value: 0 };
+        let mut direct_index = 0;
+
+        let direct_status = unsafe { ConvertInterfaceLuidToIndex(&luid, &mut direct_index) };
+        if direct_status == 0 {
+            return Err(io::Error::other(
+                "zero/reserved interface LUID unexpectedly resolved",
+            ));
+        }
+
+        unsafe { windows_sys::Win32::Foundation::SetLastError(STALE_LAST_ERROR) };
+        let error = luid_to_index(&luid)
+            .err()
+            .ok_or_else(|| io::Error::other("invalid interface LUID unexpectedly resolved"))?;
+
+        assert_eq!(
+            error.raw_os_error(),
+            Some(direct_status as i32),
+            "wrapper did not preserve the NETIO API's returned status"
+        );
+        assert_ne!(
+            error.raw_os_error(),
+            Some(STALE_LAST_ERROR as i32),
+            "wrapper returned stale GetLastError instead of the NETIO status"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod create_file_tests {
+    use super::create_file;
+    use std::io;
+
+    #[test]
+    fn missing_file_returns_error_instead_of_invalid_handle() -> io::Result<()> {
+        let missing_dir =
+            std::env::temp_dir().join(format!("tun-rs-create-file-missing-{}", std::process::id()));
+        match std::fs::remove_dir_all(&missing_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let missing_file = missing_dir.join("device");
+        let path = missing_file.to_string_lossy();
+        let error = create_file(
+            &path,
+            0,
+            0,
+            windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("CreateFileW failure returned a usable handle"))?;
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod registry_notify_status_tests {
+    use super::notify_change_key_value;
+    use std::io;
+    use windows_sys::Win32::{
+        Foundation::{SetLastError, FALSE},
+        System::Registry::REG_NOTIFY_CHANGE_LAST_SET,
+    };
+
+    #[test]
+    fn registry_notify_returns_api_status_not_stale_last_error() -> io::Result<()> {
+        const STALE_LAST_ERROR: u32 = 0x1234;
+
+        unsafe { SetLastError(STALE_LAST_ERROR) };
+        let error =
+            notify_change_key_value(std::ptr::null_mut(), FALSE, REG_NOTIFY_CHANGE_LAST_SET, 0)
+                .err()
+                .ok_or_else(|| io::Error::other("invalid registry key unexpectedly succeeded"))?;
+
+        assert_ne!(
+            error.raw_os_error(),
+            Some(STALE_LAST_ERROR as i32),
+            "wrapper returned stale GetLastError instead of registry API status"
+        );
+        Ok(())
+    }
 }

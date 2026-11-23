@@ -62,6 +62,7 @@
 | **iOS**      | ✅  | -   | Via NEPacketTunnelProvider |
 | **tvOS**     | ✅  | -   | Via NEPacketTunnelProvider |
 | **OpenHarmony** | ✅ | -  | TUN support |
+| **illumos** | ✅ | -  | TUN support |
 | **Other Unix*** | ✅ | -  | Via raw file descriptor |
 
 > **Note**: For unlisted Unix-like platforms, you can use the raw file descriptor API to integrate with platform-specific TUN implementations.
@@ -124,6 +125,10 @@ tun-rs = { version = "2", features = ["async_io"] }
 
 # For framed codec support (with tokio)
 tun-rs = { version = "2", features = ["async", "async_framed"] }
+
+# Minimal Linux build: initial builder address configuration still works,
+# but address enumeration and post-creation address management are omitted.
+tun-rs = { version = "2", default-features = false }
 ```
 
 ---
